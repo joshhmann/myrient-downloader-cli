@@ -670,14 +670,19 @@ class MyrientDownloader(App):
             remote = self.rclone_remote.strip()
             if not remote.endswith(":"):
                 remote += ":"
-            source = f"{remote}{rel_path_raw}"
+            
+            # If the remote is :http:, we need to ensure the path doesn't start with /
+            # so rclone combines it correctly with --http-url
+            source_path = rel_path_raw.lstrip("/")
+            source = f"{remote}{source_path}"
             
             # 3. Construct Destination (Windows-safe)
             dest = self.destination_folder
             if rel_path_unquoted:
                 # Remove trailing slashes and normalize separators for the OS
                 sub_path = rel_path_unquoted.strip("/").strip("\\").replace("/", os.sep)
-                dest = os.path.join(dest, sub_path)
+                if sub_path:
+                    dest = os.path.join(dest, sub_path)
             
             os.makedirs(dest, exist_ok=True)
 
@@ -724,7 +729,7 @@ class MyrientDownloader(App):
             if process.returncode == 0:
                 self.notify("Turbo Download Complete!")
             else:
-                error_msg = last_lines[-1] if last_lines else "Unknown error"
+                error_msg = last_lines[-1] if last_lines else f"Rclone failed with code {process.returncode}"
                 self.show_error(f"Rclone Failed: {error_msg}")
 
         except Exception as e:
