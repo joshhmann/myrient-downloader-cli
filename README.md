@@ -74,15 +74,12 @@ Press `?` to configure:
 | :--- | :--- |
 | **Destination Folder** | Where downloads are saved |
 | **Operation Mode** | `Download Files` or `Export Links` (writes URLs to `myrient-links-*.txt`) |
-| **Concurrent Downloads** | Number of simultaneous Python downloads (small files can run high here) |
-| **Max Requests/sec (Python)** | Global cap for all HTTP requests made by the Python downloader and scanner |
-| **Max Requests/sec (rclone)** | `rclone --tpslimit` cap used in Turbo mode |
-| **Large Files Parallel (>=1GB)** | Caps how many 1GB+ files can download at once (1-5) |
+| **Concurrent Downloads** | Main speed dial (1, 5, 8, 16, 20, 32); request/turbo governors are auto-derived from this |
 | **File Extensions** | Only download these types (e.g., `zip,7z,iso`). Leave blank for all. |
 | **Skip Existing Files** | Skip fully downloaded files, resume partial ones |
 
-Tip: start conservative (`1.0` req/sec for both caps) and only raise slowly if needed.
-Large files (>= `1 GB`) are capped separately, so you can keep small-file concurrency high without blasting big transfers in parallel.
+Tip: raise `Concurrent Downloads` gradually (e.g., `8 -> 16 -> 20`) and watch stability.
+Large files (>= `1 GB`) are still capped separately under the hood for safer parallelism.
 
 Settings are saved to `settings.json` in the app directory.
 

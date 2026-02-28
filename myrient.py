@@ -44,6 +44,14 @@ DEFAULT_RCLONE_TPS_LIMIT = 1.0
 LARGE_FILE_MIN_BYTES = 1024 * 1024 * 1024
 DEFAULT_LARGE_FILE_PARALLEL_LIMIT = 3
 MANIFEST_FILENAME = ".myrient-downloaded.jsonl"
+CONCURRENCY_GOVERNOR_MAP = {
+    1: {"python_rps": 1.0, "rclone_rps": 1.0, "large_parallel": 1},
+    5: {"python_rps": 1.5, "rclone_rps": 1.5, "large_parallel": 2},
+    8: {"python_rps": 2.0, "rclone_rps": 2.0, "large_parallel": 3},
+    16: {"python_rps": 3.0, "rclone_rps": 3.0, "large_parallel": 4},
+    20: {"python_rps": 4.0, "rclone_rps": 4.0, "large_parallel": 5},
+    32: {"python_rps": 5.0, "rclone_rps": 5.0, "large_parallel": 5},
+}
 
 
 class SettingsScreen(ModalScreen):
@@ -58,9 +66,6 @@ class SettingsScreen(ModalScreen):
         current_rclone_path="rclone",
         current_use_turbo=False,
         current_rclone_remote=":http:",
-        current_max_requests_per_second=DEFAULT_MAX_REQUESTS_PER_SECOND,
-        current_rclone_tps_limit=DEFAULT_RCLONE_TPS_LIMIT,
-        current_large_file_parallel_limit=DEFAULT_LARGE_FILE_PARALLEL_LIMIT,
         current_operation_mode="download",
     ):
         super().__init__()
@@ -71,9 +76,6 @@ class SettingsScreen(ModalScreen):
         self.current_rclone_path = current_rclone_path
         self.current_use_turbo = current_use_turbo
         self.current_rclone_remote = current_rclone_remote
-        self.current_max_requests_per_second = current_max_requests_per_second
-        self.current_rclone_tps_limit = current_rclone_tps_limit
-        self.current_large_file_parallel_limit = current_large_file_parallel_limit
         self.current_operation_mode = current_operation_mode
 
     def compose(self) -> ComposeResult:
@@ -115,23 +117,6 @@ class SettingsScreen(ModalScreen):
                     yield Label("Rclone Remote:")
                     yield Input(value=str(self.current_rclone_remote), id="rclone-remote-input", placeholder=":http: or myrient:")
 
-            with Horizontal():
-                with Vertical():
-                    yield Label("Max Requests/sec (Python):")
-                    yield Input(value=str(self.current_max_requests_per_second), id="requests-rate-input")
-                with Vertical():
-                    yield Label("Max Requests/sec (rclone):")
-                    yield Input(value=str(self.current_rclone_tps_limit), id="rclone-tps-input")
-                with Vertical():
-                    yield Label("Large Files Parallel (>=1GB):")
-                    yield Select(
-                        [("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5)],
-                        value=self.current_large_file_parallel_limit
-                        if self.current_large_file_parallel_limit in [1, 2, 3, 4, 5]
-                        else DEFAULT_LARGE_FILE_PARALLEL_LIMIT,
-                        id="large-files-select",
-                    )
-
             yield Label("File Extensions (e.g., zip,7z):")
             yield Input(value=self.current_extensions, id="extensions-input")
             
@@ -154,9 +139,6 @@ class SettingsScreen(ModalScreen):
             new_rclone_path = self.query_one("#rclone-path-input", Input).value
             new_use_turbo = self.query_one("#turbo-select", Select).value
             new_rclone_remote = self.query_one("#rclone-remote-input", Input).value
-            new_requests_rate = self.query_one("#requests-rate-input", Input).value
-            new_rclone_tps = self.query_one("#rclone-tps-input", Input).value
-            new_large_files_parallel = self.query_one("#large-files-select", Select).value
             new_operation_mode = self.query_one("#operation-mode-select", Select).value
             self.dismiss(
                 (
@@ -167,9 +149,6 @@ class SettingsScreen(ModalScreen):
                     new_rclone_path,
                     new_use_turbo,
                     new_rclone_remote,
-                    new_requests_rate,
-                    new_rclone_tps,
-                    new_large_files_parallel,
                     new_operation_mode,
                 )
             )
@@ -427,22 +406,10 @@ class MyrientDownloader(App):
                         if settings.get("operation_mode", "download") in ["download", "links"]
                         else "download"
                     )
-                    self.max_requests_per_second = self._parse_float_setting(
-                        settings.get("max_requests_per_second", DEFAULT_MAX_REQUESTS_PER_SECOND),
-                        DEFAULT_MAX_REQUESTS_PER_SECOND,
-                    )
-                    self.rclone_tps_limit = self._parse_float_setting(
-                        settings.get("rclone_tps_limit", DEFAULT_RCLONE_TPS_LIMIT),
-                        DEFAULT_RCLONE_TPS_LIMIT,
-                    )
-                    self.large_file_parallel_limit = self._parse_int_setting(
-                        settings.get("large_file_parallel_limit", DEFAULT_LARGE_FILE_PARALLEL_LIMIT),
-                        DEFAULT_LARGE_FILE_PARALLEL_LIMIT,
-                        minimum=1,
-                        maximum=5,
-                    )
+                    self._apply_governors_from_concurrency()
             else:
                 self.rclone_path = default_rclone
+                self._apply_governors_from_concurrency()
         except Exception as e:
             self.show_error(f"Error loading settings: {e}")
 
@@ -466,6 +433,15 @@ class MyrientDownloader(App):
                 json.dump(settings, f, indent=4)
         except Exception as e:
             self.show_error(f"Error saving settings: {e}")
+
+    def _apply_governors_from_concurrency(self):
+        values = CONCURRENCY_GOVERNOR_MAP.get(
+            int(self.concurrent_downloads),
+            CONCURRENCY_GOVERNOR_MAP[16],
+        )
+        self.max_requests_per_second = float(values["python_rps"])
+        self.rclone_tps_limit = float(values["rclone_rps"])
+        self.large_file_parallel_limit = int(values["large_parallel"])
 
     def _get_manifest_path(self):
         return os.path.join(self.destination_folder, MANIFEST_FILENAME)
@@ -531,17 +507,6 @@ class MyrientDownloader(App):
     def _parse_int_setting(self, value, default, minimum=1, maximum=32):
         try:
             parsed = int(value)
-            if parsed < minimum:
-                return minimum
-            if parsed > maximum:
-                return maximum
-            return parsed
-        except (TypeError, ValueError):
-            return default
-
-    def _parse_float_setting(self, value, default, minimum=0.1, maximum=100.0):
-        try:
-            parsed = float(value)
             if parsed < minimum:
                 return minimum
             if parsed > maximum:
@@ -871,9 +836,6 @@ class MyrientDownloader(App):
                     new_rclone,
                     new_turbo,
                     new_remote,
-                    new_requests_rate,
-                    new_rclone_tps,
-                    new_large_files_parallel,
                     new_operation_mode,
                 ) = result
                 previous_dest = self.destination_folder
@@ -892,20 +854,7 @@ class MyrientDownloader(App):
                 self.operation_mode = (
                     new_operation_mode if new_operation_mode in ["download", "links"] else "download"
                 )
-                self.max_requests_per_second = self._parse_float_setting(
-                    new_requests_rate,
-                    self.max_requests_per_second,
-                )
-                self.rclone_tps_limit = self._parse_float_setting(
-                    new_rclone_tps,
-                    self.rclone_tps_limit,
-                )
-                self.large_file_parallel_limit = self._parse_int_setting(
-                    new_large_files_parallel,
-                    self.large_file_parallel_limit,
-                    minimum=1,
-                    maximum=5,
-                )
+                self._apply_governors_from_concurrency()
                 if previous_dest != self.destination_folder:
                     self._load_download_manifest()
                 self.save_settings()
@@ -922,9 +871,6 @@ class MyrientDownloader(App):
                 self.rclone_path,
                 self.use_turbo,
                 self.rclone_remote,
-                self.max_requests_per_second,
-                self.rclone_tps_limit,
-                self.large_file_parallel_limit,
                 self.operation_mode,
             ),
             set_settings,
@@ -1305,6 +1251,7 @@ class MyrientDownloader(App):
 
             last_lines = []
             files_done = 0
+            copied_files = set()
             if process.stdout is not None:
                 for raw_line in process.stdout:
                     if worker.is_cancelled:
@@ -1320,9 +1267,13 @@ class MyrientDownloader(App):
                         last_lines.pop(0)
 
                     if ": Copied (" in line_str or ": Copied(" in line_str:
-                        files_done += 1
                         parts = line_str.split(": Copied")
                         fname = parts[0].rsplit(":", 1)[-1].strip() if parts else ""
+                        if fname:
+                            copied_files.add(fname)
+                            files_done = len(copied_files)
+                        else:
+                            files_done += 1
                         short = fname.rsplit("/", 1)[-1] if fname else ""
                         self._update_status_label(f"Turbo [{files_done}] done: {short}")
                     elif "Transferred:" in line_str or "Checks:" in line_str:
