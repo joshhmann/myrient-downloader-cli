@@ -671,12 +671,10 @@ class MyrientDownloader(App):
             if not remote.endswith(":"):
                 remote += ":"
             
-            # Ensure path starts with / for rclone to resolve correctly from root
-            source_path = rel_path_raw
-            if not source_path.startswith("/"):
-                source_path = "/" + source_path
-                
-            source = f"{remote}{source_path}"
+            # rel_path_raw already includes encoding from urljoin/requests
+            # We need to ensure we don't end up with remote://path
+            clean_rel_path = rel_path_raw.lstrip("/")
+            source = f"{remote}/{clean_rel_path}"
             
             # 3. Construct Destination (Windows/Linux safe)
             dest = self.destination_folder
