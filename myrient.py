@@ -883,146 +883,234 @@ class MyrientDownloader(App):
         
         return False, name, "Max retries exceeded", 0
 
+    def _scan_directories(self, initial_queue, file_queue, worker, scan_done_event):
+        """Scanner: walks directories concurrently and feeds files into file_queue."""
+        import queue as queue_module
+
+        files_found = 0
+        dirs_scanned = 0
+        dir_queue = queue_module.Queue()
+        scan_lock = threading.Lock()
+        active_scanners = 0
+        active_lock = threading.Lock()
+
+        # Separate initial items into dirs and files
+        for name, is_dir, url in initial_queue:
+            if is_dir:
+                dir_queue.put((name, url))
+            elif self.should_download_file(name):
+                files_found += 1
+                with self.download_lock:
+                    self.total_files_to_download = files_found
+                file_queue.put((name, url))
+
+        def scan_one_dir(dir_name, dir_url, session):
+            nonlocal files_found, dirs_scanned
+            if worker.is_cancelled:
+                return
+
+            scan_path = (
+                unquote(dir_url[len(BASE_URL):])
+                if dir_url.startswith(BASE_URL)
+                else dir_url
+            )
+
+            with scan_lock:
+                dirs_scanned += 1
+            self._update_status_label(
+                f"Scanning ({files_found} files, {dirs_scanned} dirs): {scan_path}"
+            )
+
+            try:
+                response = session.get(dir_url, timeout=30)
+                response.raise_for_status()
+                items = self.parse_directory_html(response.text, dir_url)
+
+                for item_name, item_is_dir, item_url, _ in items:
+                    if worker.is_cancelled:
+                        return
+                    if item_is_dir:
+                        dir_queue.put((item_name, item_url))
+                    elif self.should_download_file(item_name):
+                        with scan_lock:
+                            files_found += 1
+                        with self.download_lock:
+                            self.total_files_to_download = files_found
+                        file_queue.put((item_name, item_url))
+
+            except Exception as e:
+                self._show_error_safe(f"Error scanning {dir_name}: {e}")
+
+        SCAN_WORKERS = 5
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
+            futures = set()
+
+            while True:
+                if worker.is_cancelled:
+                    break
+
+                # Submit any pending directories
+                try:
+                    while True:
+                        dir_name, dir_url = dir_queue.get_nowait()
+                        session = self.get_retry_session()
+                        future = executor.submit(scan_one_dir, dir_name, dir_url, session)
+                        futures.add(future)
+                except queue_module.Empty:
+                    pass
+
+                # Clean up completed futures
+                done = {f for f in futures if f.done()}
+                for f in done:
+                    futures.discard(f)
+
+                # If no futures running and queue empty, we're done
+                if not futures and dir_queue.empty():
+                    break
+
+                time.sleep(0.05)
+
+        scan_done_event.set()
+
     @work(thread=True, exclusive=True)
     def start_download_worker(self):
         self.is_downloading = True
         self.query_one("#status-bar").add_class("downloading")
         progress_bar = self.query_one("#progress", ProgressBar)
         progress_bar.display = True
-        status_label = self.query_one("#status-text", Label)
 
         try:
-            queue = list(self.download_queue)
+            import queue as queue_module
+
+            scan_queue = list(self.download_queue)
             worker = get_current_worker()
-            session = self.get_retry_session()
+            file_queue = queue_module.Queue()
+            scan_done_event = threading.Event()
 
-            # Phase 1: Scan directories to build flat file list
-            file_list = []
-            while queue:
-                if worker.is_cancelled:
-                    return
-
-                name, is_dir, url = queue.pop(0)
-
-                if is_dir:
-                    scan_path = (
-                        unquote(url[len(BASE_URL):])
-                        if url.startswith(BASE_URL)
-                        else url
-                    )
-                    status_label.update(Text(f"Scanning: {scan_path}"))
-                    try:
-                        response = session.get(url, timeout=30)
-                        response.raise_for_status()
-                        items = self.parse_directory_html(response.text, url)
-                        for item_name, item_is_dir, item_url, _ in items:
-                            queue.append((item_name, item_is_dir, item_url))
-                    except Exception as e:
-                        self.show_error(f"Error scanning {name}: {e}")
-                    continue
-
-                # Apply extension filter
-                if not self.should_download_file(name):
-                    continue
-
-                file_list.append((name, url))
-
-            if not file_list:
-                self.is_downloading = False
-                self.query_one("#status-bar").remove_class("downloading")
-                progress_bar.display = False
-                status_label.update("Ready")
-                self.notify("No files to download.")
-                return
-
-            self.total_files_to_download = len(file_list)
+            self.total_files_to_download = 0
             self.files_completed = 0
             self.files_failed = 0
             self.files_skipped = 0
 
-            status_label.update(Text(f"Downloading {len(file_list)} files..."))
-
-            # Phase 2: Download files
             max_workers = max(1, self.concurrent_downloads)
 
             if max_workers > 1:
-                # Concurrent downloads
                 self.app.call_from_thread(self.add_class, "concurrent-downloading")
                 self.app.call_from_thread(self.clear_download_widgets)
 
-                for name, url in file_list:
-                    self.add_download_widget(name)
+            # Start scanner thread
+            scanner = threading.Thread(
+                target=self._scan_directories,
+                args=(scan_queue, file_queue, worker, scan_done_event),
+                daemon=True,
+            )
+            scanner.start()
 
+            def _update_progress():
+                done = self.files_completed + self.files_failed + self.files_skipped
+                total = self.total_files_to_download
+                self._update_status_label(
+                    f"Progress: {done}/{total} "
+                    f"({self.files_completed} done, {self.files_failed} failed, {self.files_skipped} skipped)"
+                )
+
+            def _handle_result(file_info, result):
+                status, name, error, size = result
+                if status == "skipped":
+                    with self.download_lock:
+                        self.files_skipped += 1
+                    if max_workers > 1:
+                        self.app.call_from_thread(self.mark_download_complete, name, skipped=True)
+                elif status:
+                    with self.download_lock:
+                        self.files_completed += 1
+                    if max_workers > 1:
+                        self.app.call_from_thread(self.mark_download_complete, name, success=True)
+                else:
+                    with self.download_lock:
+                        self.files_failed += 1
+                    if max_workers > 1:
+                        self.app.call_from_thread(self.mark_download_complete, name, success=False, error=error)
+                    else:
+                        self._show_error_safe(f"Failed: {name}: {error}")
+                _update_progress()
+
+            if max_workers > 1:
+                # Concurrent: submit downloads as scanner finds files
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {}
-                    for file_info in file_list:
-                        if worker.is_cancelled:
-                            break
-                        future = executor.submit(self.download_single_file, file_info, worker)
-                        futures[future] = file_info
 
-                    for future in as_completed(futures):
+                    while not (scan_done_event.is_set() and file_queue.empty()):
                         if worker.is_cancelled:
                             executor.shutdown(wait=False, cancel_futures=True)
                             return
 
-                        file_info = futures[future]
+                        # Submit new files from queue
                         try:
-                            result = future.result()
-                            status, name, error, size = result
+                            file_info = file_queue.get(timeout=0.1)
+                            name, url = file_info
+                            self.add_download_widget(name)
+                            future = executor.submit(self.download_single_file, file_info, worker)
+                            futures[future] = file_info
+                        except queue_module.Empty:
+                            pass
 
-                            if status == "skipped":
-                                with self.download_lock:
-                                    self.files_skipped += 1
-                                self.app.call_from_thread(self.mark_download_complete, name, skipped=True)
-                            elif status:
-                                with self.download_lock:
-                                    self.files_completed += 1
-                                self.app.call_from_thread(self.mark_download_complete, name, success=True)
-
-                            else:
+                        # Collect completed futures
+                        done_futures = [f for f in futures if f.done()]
+                        for future in done_futures:
+                            file_info = futures.pop(future)
+                            try:
+                                _handle_result(file_info, future.result())
+                            except Exception as e:
                                 with self.download_lock:
                                     self.files_failed += 1
-                                self.app.call_from_thread(self.mark_download_complete, name, success=False, error=error)
+                                self.app.call_from_thread(
+                                    self.mark_download_complete, file_info[0], success=False, error=str(e)
+                                )
+                                _update_progress()
 
-
+                    # Wait for remaining downloads to finish
+                    for future in as_completed(futures):
+                        if worker.is_cancelled:
+                            return
+                        file_info = futures[future]
+                        try:
+                            _handle_result(file_info, future.result())
                         except Exception as e:
                             with self.download_lock:
                                 self.files_failed += 1
-                            self.app.call_from_thread(self.mark_download_complete, file_info[0], success=False, error=str(e))
-
-                        done = self.files_completed + self.files_failed + self.files_skipped
-                        self._update_status_label(
-                            f"Progress: {done}/{self.total_files_to_download} "
-                            f"({self.files_completed} done, {self.files_failed} failed, {self.files_skipped} skipped)"
-                        )
+                            self.app.call_from_thread(
+                                self.mark_download_complete, file_info[0], success=False, error=str(e)
+                            )
+                            _update_progress()
 
                 self.app.call_from_thread(self.remove_class, "concurrent-downloading")
 
             else:
-                # Sequential downloads (original behavior)
-                for i, (name, url) in enumerate(file_list):
+                # Sequential: download files as scanner finds them
+                file_index = 0
+                while not (scan_done_event.is_set() and file_queue.empty()):
                     if worker.is_cancelled:
                         return
 
-                    status_label.update(Text(f"Downloading ({i+1}/{len(file_list)}): {name}"))
+                    try:
+                        file_info = file_queue.get(timeout=0.1)
+                    except queue_module.Empty:
+                        continue
 
-                    result = self.download_single_file((name, url), worker)
-                    status, fname, error, size = result
+                    file_index += 1
+                    name, url = file_info
+                    self._update_status_label(f"Downloading ({file_index}): {name}")
 
-                    if status == "skipped":
-                        self.files_skipped += 1
-                    elif status:
-                        self.files_completed += 1
-                        progress_bar.update(total=len(file_list), progress=i + 1)
-                    else:
-                        self.files_failed += 1
-                        self.show_error(f"Failed: {name}: {error}")
+                    result = self.download_single_file(file_info, worker)
+                    _handle_result(file_info, result)
+
+            scanner.join(timeout=5)
 
             self.is_downloading = False
             self.query_one("#status-bar").remove_class("downloading")
             progress_bar.display = False
-            status_label.update("Ready")
+            self.query_one("#status-text", Label).update("Ready")
             self.notify(
                 f"Done! {self.files_completed} downloaded, "
                 f"{self.files_failed} failed, {self.files_skipped} skipped"
@@ -1033,7 +1121,7 @@ class MyrientDownloader(App):
             self.is_downloading = False
             self.query_one("#status-bar").remove_class("downloading")
             progress_bar.display = False
-            status_label.update("Error")
+            self.query_one("#status-text", Label).update("Error")
 
     def stop_download(self):
         """Cancel the download worker."""
