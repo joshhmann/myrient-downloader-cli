@@ -681,7 +681,7 @@ class MyrientDownloader(App):
                         total_length += downloaded
                     
                     with open(filepath, mode) as f:
-                        for chunk in r.iter_content(chunk_size=8192):
+                        for chunk in r.iter_content(chunk_size=65536):
                             if worker.is_cancelled:
                                 return False, name, "Cancelled", downloaded
                             if chunk:
@@ -826,18 +826,21 @@ class MyrientDownloader(App):
             )
             scanner.start()
 
+            active_count = 0
+
             def _update_progress(current_file=None):
                 done = self.files_completed + self.files_failed + self.files_skipped
                 total = self.total_files_to_download
-                scanning = "" if scan_done_event.is_set() else " (scanning...)"
+                scanning = " scanning..." if not scan_done_event.is_set() else ""
+                workers_info = f" [{active_count} active]" if max_workers > 1 else ""
                 if current_file:
                     self._update_status_label(
-                        f"[{done}/{total}{scanning}] {current_file}"
+                        f"[{done}/{total}{workers_info}{scanning}] {current_file}"
                     )
                 else:
                     self._update_status_label(
-                        f"Progress: {done}/{total}{scanning} "
-                        f"({self.files_completed} done, {self.files_failed} failed, {self.files_skipped} skipped)"
+                        f"[{done}/{total}{workers_info}{scanning}] "
+                        f"{self.files_completed} done, {self.files_failed} failed, {self.files_skipped} skipped"
                     )
 
             def _handle_result(file_info, result):
@@ -887,6 +890,7 @@ class MyrientDownloader(App):
 
                         # 2. Clean up finished futures BEFORE submitting new ones
                         active = {f: info for f, info in active.items() if not f.done()}
+                        active_count = len(active)
 
                         # 3. Fill the pool back up
                         while len(active) < max_workers:
