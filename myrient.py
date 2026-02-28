@@ -872,17 +872,7 @@ class MyrientDownloader(App):
                             executor.shutdown(wait=False, cancel_futures=True)
                             return
 
-                        # Submit files in batches — keep the pool full
-                        while len(active) < max_workers:
-                            try:
-                                file_info = file_queue.get_nowait()
-                                future = executor.submit(_wrap_download, file_info)
-                                active[future] = file_info
-                                _update_progress(file_info[0])
-                            except queue_module.Empty:
-                                break
-
-                        # Collect results without polling futures
+                        # 1. Collect results
                         try:
                             while True:
                                 file_info, result, error = results_queue.get_nowait()
@@ -895,12 +885,20 @@ class MyrientDownloader(App):
                         except queue_module.Empty:
                             pass
 
-                        # Clean up done futures from active set
-                        done = [f for f in active if f.done()]
-                        for f in done:
-                            del active[f]
+                        # 2. Clean up finished futures BEFORE submitting new ones
+                        active = {f: info for f, info in active.items() if not f.done()}
 
-                        # Brief sleep only if nothing to do right now
+                        # 3. Fill the pool back up
+                        while len(active) < max_workers:
+                            try:
+                                file_info = file_queue.get_nowait()
+                                future = executor.submit(_wrap_download, file_info)
+                                active[future] = file_info
+                                _update_progress(file_info[0])
+                            except queue_module.Empty:
+                                break
+
+                        # Brief sleep only when pool is full or waiting for work
                         if len(active) >= max_workers or (file_queue.empty() and active):
                             time.sleep(0.05)
 
