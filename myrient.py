@@ -46,12 +46,12 @@ LARGE_FILE_MIN_BYTES = 1024 * 1024 * 1024
 DEFAULT_LARGE_FILE_PARALLEL_LIMIT = 3
 MANIFEST_FILENAME = ".myrient-downloaded.jsonl"
 CONCURRENCY_GOVERNOR_MAP = {
-    1: {"python_rps": 1.0, "rclone_rps": 1.0, "large_parallel": 1},
-    5: {"python_rps": 1.5, "rclone_rps": 1.5, "large_parallel": 2},
-    8: {"python_rps": 2.0, "rclone_rps": 2.0, "large_parallel": 3},
-    16: {"python_rps": 3.0, "rclone_rps": 3.0, "large_parallel": 4},
-    20: {"python_rps": 4.0, "rclone_rps": 4.0, "large_parallel": 5},
-    32: {"python_rps": 5.0, "rclone_rps": 5.0, "large_parallel": 5},
+    1: {"python_rps": 2.0, "rclone_rps": 2.0, "large_parallel": 1},
+    5: {"python_rps": 8.0, "rclone_rps": 8.0, "large_parallel": 2},
+    8: {"python_rps": 12.0, "rclone_rps": 12.0, "large_parallel": 3},
+    16: {"python_rps": 20.0, "rclone_rps": 20.0, "large_parallel": 4},
+    20: {"python_rps": 26.0, "rclone_rps": 26.0, "large_parallel": 5},
+    32: {"python_rps": 40.0, "rclone_rps": 40.0, "large_parallel": 5},
 }
 
 
@@ -443,6 +443,12 @@ class MyrientDownloader(App):
         self.max_requests_per_second = float(values["python_rps"])
         self.rclone_tps_limit = float(values["rclone_rps"])
         self.large_file_parallel_limit = int(values["large_parallel"])
+
+    def _derive_rclone_workers(self):
+        concurrency = max(1, int(self.concurrent_downloads))
+        transfers = max(1, min(concurrency, 32))
+        checkers = max(4, min(transfers * 2, 64))
+        return transfers, checkers
 
     def _get_manifest_path(self):
         return os.path.join(self.destination_folder, MANIFEST_FILENAME)
@@ -1022,89 +1028,61 @@ class MyrientDownloader(App):
             )
             return 0, 0
 
-        large_file_semaphore = threading.Semaphore(max(1, self.large_file_parallel_limit))
         max_workers = max(1, self.concurrent_downloads)
         done_count = 0
         fail_count = 0
+        previous_large_semaphore = self.large_file_semaphore
+        self.large_file_semaphore = threading.Semaphore(max(1, self.large_file_parallel_limit))
+        self.retry_counts = {}
 
-        def run_copyurl(file_info):
+        def run_download(file_info):
             name, file_url, size_bytes = file_info
             if worker.is_cancelled:
                 return "cancelled", name, "Cancelled", file_url, None, size_bytes
 
-            is_large = size_bytes is not None and size_bytes >= LARGE_FILE_MIN_BYTES
-            has_large_slot = False
-
+            rel_path = unquote(file_url[len(BASE_URL):]) if file_url.startswith(BASE_URL) else name
+            local_path = os.path.join(self.destination_folder, rel_path.replace("/", os.sep))
             try:
-                if is_large:
-                    large_file_semaphore.acquire()
-                    has_large_slot = True
+                result = self.download_single_file(file_info, worker)
+            except Exception as e:
+                return "failed", name, str(e), file_url, local_path, size_bytes
 
-                rel_path = unquote(file_url[len(BASE_URL):]) if file_url.startswith(BASE_URL) else name
-                local_path = os.path.join(self.destination_folder, rel_path.replace("/", os.sep))
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-                if self.skip_existing_files and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-                    return "skipped", name, None, file_url, local_path, os.path.getsize(local_path)
-
-                cmd = [
-                    self.rclone_path,
-                    "copyurl",
-                    file_url,
-                    local_path,
-                    "--user-agent",
-                    "Mozilla/5.0",
-                    "--tpslimit",
-                    str(self.rclone_tps_limit),
-                    "--tpslimit-burst",
-                    "1",
-                    "--retries",
-                    "3",
-                    "--low-level-retries",
-                    "5",
-                ]
-
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                )
-                if result.returncode == 0:
-                    final_size = os.path.getsize(local_path) if os.path.exists(local_path) else size_bytes
-                    return "done", name, None, file_url, local_path, final_size
-
-                error_line = (result.stderr or result.stdout or f"Exit Code {result.returncode}").strip()
-                if error_line:
-                    error_line = error_line.splitlines()[-1][:180]
-                return "failed", name, error_line, file_url, local_path, size_bytes
-            finally:
-                if has_large_slot:
-                    large_file_semaphore.release()
+            status, _name, error, downloaded_size = result
+            if status is True:
+                final_size = downloaded_size if downloaded_size is not None else size_bytes
+                return "done", name, None, file_url, local_path, final_size
+            if status == "skipped":
+                final_size = downloaded_size if downloaded_size is not None else size_bytes
+                return "skipped", name, None, file_url, local_path, final_size
+            return "failed", name, error or "Unknown error", file_url, local_path, downloaded_size
 
         total = len(files)
         self.app.call_from_thread(lambda: self._set_progress_values(0, total))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(run_copyurl, file_info) for file_info in files]
-            for future in as_completed(futures):
-                if worker.is_cancelled:
-                    break
-                status, name, error, file_url, local_path, file_size = future.result()
-                if status == "failed":
-                    fail_count += 1
-                    self._show_error_safe(f"Turbo failed: {name}: {error}")
-                elif status == "done":
-                    done_count += 1
-                    self._record_download_manifest(file_url, local_path, size_bytes=file_size, status="done")
-                elif status == "skipped":
-                    done_count += 1
-                    self._record_download_manifest(file_url, local_path, size_bytes=file_size, status="skipped")
+        self._update_status_label(
+            f"Turbo fallback: in-process downloader ({max_workers} workers, no per-file rclone spawn)"
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(run_download, file_info) for file_info in files]
+                for future in as_completed(futures):
+                    if worker.is_cancelled:
+                        break
+                    status, name, error, file_url, local_path, file_size = future.result()
+                    if status == "failed":
+                        fail_count += 1
+                        self._show_error_safe(f"Turbo failed: {name}: {error}")
+                    elif status == "done":
+                        done_count += 1
+                        self._record_download_manifest(file_url, local_path, size_bytes=file_size, status="done")
+                    elif status == "skipped":
+                        done_count += 1
+                        self._record_download_manifest(file_url, local_path, size_bytes=file_size, status="skipped")
 
-                progress_done = done_count + fail_count
-                self._update_status_label(f"Turbo [{progress_done}/{total}] {done_count} done, {fail_count} failed")
-                self.app.call_from_thread(lambda d=progress_done, t=total: self._set_progress_values(d, t))
+                    progress_done = done_count + fail_count
+                    self._update_status_label(f"Turbo [{progress_done}/{total}] {done_count} done, {fail_count} failed")
+                    self.app.call_from_thread(lambda d=progress_done, t=total: self._set_progress_values(d, t))
+        finally:
+            self.large_file_semaphore = previous_large_semaphore
 
         return done_count, fail_count
 
@@ -1217,16 +1195,21 @@ class MyrientDownloader(App):
                     dest = os.path.join(dest, sub_path)
             
             os.makedirs(dest, exist_ok=True)
+            transfers, checkers = self._derive_rclone_workers()
+            tps_burst = max(1, min(int(self.rclone_tps_limit * 2), 20))
 
             cmd = [
                 self.rclone_path,
                 "copy",
                 source,
                 dest,
-                "--transfers", "4",
-                "--checkers", "4",
+                "--transfers",
+                str(transfers),
+                "--checkers",
+                str(checkers),
                 "--tpslimit", str(self.rclone_tps_limit),
-                "--tpslimit-burst", "1",
+                "--tpslimit-burst",
+                str(tps_burst),
                 "--stats", "2s",
                 "--progress",
                 "--user-agent", "Mozilla/5.0",
