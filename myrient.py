@@ -645,18 +645,7 @@ class MyrientDownloader(App):
         if self.skip_existing_files and os.path.exists(filepath):
             local_size = os.path.getsize(filepath)
             if local_size > 0:
-                try:
-                    head_resp = session.head(url, allow_redirects=True, timeout=(10, 15))
-                    remote_size = int(head_resp.headers.get("content-length", 0))
-                    if remote_size > 0 and local_size >= remote_size:
-                        return "skipped", name, "File already exists", local_size
-                    elif remote_size == 0:
-                        # Server didn't report size — trust local file
-                        return "skipped", name, "File already exists", local_size
-                    # File is partial — fall through to resume download
-                except Exception:
-                    # Can't reach server, trust local file
-                    return "skipped", name, "File already exists", local_size
+                return "skipped", name, "File already exists", local_size
 
         retry_key = url
         with self.download_lock:
