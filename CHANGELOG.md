@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-02-27
+
+### Added
+- **Concurrent Downloads**: Download multiple files simultaneously (1, 3, 5, 10, or 20). Configurable in settings.
+- **File Search**: Search for files and folders across current directory, subdirectories, or entire site. Supports substring matching and glob patterns.
+- **Extension Filter**: Only download specific file types (e.g., `zip,7z,iso`).
+- **Skip Existing / Resume**: Skip fully downloaded files and automatically resume partial downloads.
+- **Per-File Progress**: Individual progress widgets for each file during concurrent downloads.
+- **Script Installer**: `install.sh` (Linux/macOS) and `install.bat` (Windows) for easy setup with `myrient-cli` command.
+
+### Changed
+- Download worker now scans all directories first, then downloads files (allows concurrent processing).
+- Settings screen expanded with concurrent downloads, extension filter, and skip existing options.
+- Search uses substring matching by default, glob patterns when wildcards are present.
+
+### Removed
+- Removed pip/PyPI installation method in favor of script installer.
+- Removed download history logging.
+
 ## [0.4.0] - 2025-12-04
 
 ### Added

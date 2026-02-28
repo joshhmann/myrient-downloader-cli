@@ -3,7 +3,9 @@
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -14,12 +16,13 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
 from textual.events import Key
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
+    Select,
     Button,
     DataTable,
     Footer,
@@ -36,21 +39,38 @@ from urllib3.util.retry import Retry
 
 BASE_URL = "https://myrient.erista.me/files/"
 SETTINGS_FILE = "settings.json"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 class SettingsScreen(ModalScreen):
     BINDINGS = [("escape", "close_settings", "Close")]
 
-    def __init__(self, current_dest):
+    def __init__(self, current_dest, current_concurrent=1, current_extensions="", current_skip_existing=False):
         super().__init__()
         self.current_dest = current_dest
+        self.current_concurrent = current_concurrent
+        self.current_extensions = current_extensions
+        self.current_skip_existing = current_skip_existing
 
     def compose(self) -> ComposeResult:
         with Container(id="settings-dialog"):
             yield Label("Settings", id="settings-title")
             yield Label("Destination Folder:")
             yield Input(value=self.current_dest, id="dest-input")
+            yield Label("Concurrent Downloads:")
+            yield Select(
+                [("Sequential (1)", 1), ("3 files", 3), ("5 files", 5), ("10 files", 10), ("20 files", 20)],
+                value=self.current_concurrent,
+                id="concurrent-select"
+            )
+            yield Label("File Extensions (comma-separated, e.g., zip,7z,iso):")
+            yield Input(value=self.current_extensions, id="extensions-input")
+            yield Label("Skip Existing Files:")
+            yield Select(
+                [("No", False), ("Yes", True)],
+                value=self.current_skip_existing,
+                id="skip-existing-select"
+            )
             with Horizontal(id="settings-buttons"):
                 yield Button("Save", variant="primary", id="save-btn")
                 yield Button("Cancel", variant="error", id="cancel-btn")
@@ -58,12 +78,101 @@ class SettingsScreen(ModalScreen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "save-btn":
             new_dest = self.query_one("#dest-input", Input).value
-            self.dismiss(new_dest)
+            new_concurrent = self.query_one("#concurrent-select", Select).value
+            new_extensions = self.query_one("#extensions-input", Input).value
+            new_skip_existing = self.query_one("#skip-existing-select", Select).value
+            self.dismiss((new_dest, new_concurrent, new_extensions, new_skip_existing))
         else:
             self.dismiss(None)
 
     def action_close_settings(self):
         self.dismiss(None)
+
+
+class SearchScreen(ModalScreen):
+    """Screen for searching files recursively."""
+    BINDINGS = [("escape", "close_search", "Close")]
+
+    def __init__(self, current_url):
+        super().__init__()
+        self.current_url = current_url
+
+    def compose(self) -> ComposeResult:
+        with Container(id="search-dialog"):
+            yield Label("Search Files", id="search-title")
+            yield Label("Enter search pattern (wildcards supported):")
+            yield Input(placeholder="*.zip or PS2", id="search-input")
+            with Horizontal(id="search-options"):
+                yield Label("Scope:")
+                yield Select(
+                    [("Current dir", "current"), ("Current & subdirs", "recursive"), ("Entire site", "all")],
+                    value="current",
+                    id="search-scope"
+                )
+            with Horizontal(id="search-buttons"):
+                yield Button("Search", variant="primary", id="search-btn")
+                yield Button("Cancel", variant="error", id="cancel-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "search-btn":
+            pattern = self.query_one("#search-input", Input).value.strip()
+            scope = self.query_one("#search-scope", Select).value
+            if pattern:
+                self.dismiss(("search", pattern, scope))
+        else:
+            self.dismiss(None)
+
+    def action_close_search(self):
+        self.dismiss(None)
+
+
+class DownloadProgressItem(Static):
+    """Widget showing progress for a single file download."""
+
+    def __init__(self, filename, total_size=0):
+        super().__init__()
+        self.filename = filename
+        self.total_size = total_size
+        self.add_class("download-item")
+
+    def compose(self) -> ComposeResult:
+        yield Label(self.filename, classes="download-filename")
+        yield ProgressBar(total=self.total_size or 100, show_eta=False, classes="download-progress")
+        yield Label("Waiting...", classes="download-status")
+
+    def update_progress(self, downloaded, total):
+        try:
+            bar = self.query_one(ProgressBar)
+            status = self.query(Label)[-1]
+            bar.update(total=total, progress=downloaded)
+            if total > 0:
+                pct = (downloaded / total) * 100
+                mb_down = downloaded / (1024 * 1024)
+                mb_total = total / (1024 * 1024)
+                status.update(f"{mb_down:.1f} / {mb_total:.1f} MB ({pct:.0f}%)")
+        except Exception:
+            pass
+
+    def mark_completed(self):
+        self.add_class("completed")
+        try:
+            self.query(Label)[-1].update("Complete")
+        except Exception:
+            pass
+
+    def mark_failed(self, error="Unknown error"):
+        self.add_class("failed")
+        try:
+            self.query(Label)[-1].update(f"Failed: {error}")
+        except Exception:
+            pass
+
+    def mark_skipped(self):
+        self.add_class("skipped")
+        try:
+            self.query(Label)[-1].update("Skipped (exists)")
+        except Exception:
+            pass
 
 
 class MyrientDownloader(App):
@@ -103,6 +212,66 @@ class MyrientDownloader(App):
     .downloading ProgressBar {
         display: block;
     }
+    #download-progress-container {
+        height: 20;
+        border: solid green;
+        padding: 1;
+        display: none;
+    }
+    .concurrent-downloading #download-progress-container {
+        display: block;
+    }
+    #downloads-title {
+        text-align: center;
+        text-style: bold;
+    }
+    #download-progress-scroll {
+        height: 1fr;
+    }
+    .download-item {
+        height: auto;
+        padding: 0 1;
+        border: solid $primary-darken-3;
+        margin: 0 1;
+    }
+    .download-filename {
+        text-style: bold;
+        height: auto;
+    }
+    .download-progress {
+        display: block;
+        height: 1;
+    }
+    .download-status {
+        height: auto;
+        color: $text-muted;
+    }
+    .download-item.completed {
+        border: solid green;
+    }
+    .download-item.failed {
+        border: solid red;
+    }
+    .download-item.skipped {
+        border: solid yellow;
+    }
+    #search-dialog {
+        padding: 1;
+        border: solid blue;
+        width: 80;
+        height: auto;
+        background: $surface;
+        align: center middle;
+    }
+    #search-title {
+        text-align: center;
+        text-style: bold;
+        color: $text;
+    }
+    #search-buttons {
+        margin-top: 1;
+        align: center middle;
+    }
     """
 
     BINDINGS = [
@@ -111,15 +280,34 @@ class MyrientDownloader(App):
         Binding("escape", "handle_esc", "Stop/Clear"),
         Binding("backspace", "go_up", "Up"),
         Binding("ctrl+q", "handle_quit", "Quit"),
+        Binding("slash", "open_search", "Search"),
     ]
 
     current_url = reactive(BASE_URL)
     destination_folder = reactive(os.getcwd())
+    concurrent_downloads = reactive(1)
+    file_extensions = reactive("")
+    skip_existing_files = reactive(False)
     download_queue = []
     is_downloading = reactive(False)
     is_loading_dir = reactive(False)
     current_download_worker = None
     last_esc_time = 0
+    # For tracking concurrent downloads
+    download_progress = {}
+    download_lock = threading.Lock()
+    total_files_to_download = 0
+    files_completed = 0
+    files_failed = 0
+    files_skipped = 0
+    # Retry counter per file
+    retry_counts = {}
+    # Widget references for concurrent downloads
+    download_widgets = {}
+    # File listing data
+    row_data = {}
+    # Thread-local storage for sessions (each thread gets its own session)
+    _thread_local = threading.local()
 
     search_query = ""
     last_search_time = 0
@@ -147,10 +335,59 @@ class MyrientDownloader(App):
         self.notify(message, severity="error")
         print(f"ERROR: {message}", file=sys.stderr)
 
+    def _safe_ui_update(self, func):
+        """Execute UI function from any thread safely."""
+        if hasattr(self, 'app') and self.app:
+            self.app.call_from_thread(func)
+        else:
+            func()
+
+    def _update_status_label(self, message):
+        """Update status label from any thread."""
+        def _update():
+            try:
+                self.query_one("#status-text", Label).update(message)
+            except Exception:
+                pass
+        self._safe_ui_update(_update)
+
+    def _show_error_safe(self, message):
+        """Show error from any thread."""
+        self._safe_ui_update(lambda: self.show_error(message))
+
+    def _set_downloading_ui(self, downloading=True):
+        """Set downloading UI state from any thread."""
+        def _update():
+            try:
+                if downloading:
+                    self.is_downloading = True
+                    self.query_one("#status-bar").add_class("downloading")
+                    self.query_one("#progress", ProgressBar).display = True
+                else:
+                    self.is_downloading = False
+                    self.query_one("#status-bar").remove_class("downloading")
+                    self.query_one("#progress", ProgressBar).display = False
+                    self.query_one("#status-text", Label).update("Ready")
+            except Exception:
+                pass
+        self._safe_ui_update(_update)
+
+    def _notify_safe(self, message, severity=None):
+        """Show notification from any thread."""
+        if severity:
+            self._safe_ui_update(lambda: self.notify(message, severity=severity))
+        else:
+            self._safe_ui_update(lambda: self.notify(message))
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Label(f"Current: {self.current_url}", id="url-label")
         yield DataTable(id="file-list", cursor_type="row")
+        # Download progress container for concurrent downloads
+        with Container(id="download-progress-container"):
+            yield Label("Downloads", id="downloads-title")
+            with ScrollableContainer(id="download-progress-scroll"):
+                pass
         with Container(id="status-bar"):
             yield Label("Ready", id="status-text")
             yield ProgressBar(total=100, show_eta=True, id="progress")
@@ -167,10 +404,15 @@ class MyrientDownloader(App):
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE, "r") as f:
                     settings = json.load(f)
-                    self.destination_folder = settings.get(
-                        "destination_folder", os.getcwd()
-                    )
+                    # Handle case where old settings might have corrupted destination_folder
+                    dest = settings.get("destination_folder", os.getcwd())
+                    if isinstance(dest, (list, tuple)):
+                        dest = dest[0] if len(dest) > 0 else os.getcwd()
+                    self.destination_folder = dest
                     self.current_url = settings.get("last_url", BASE_URL)
+                    self.concurrent_downloads = settings.get("concurrent_downloads", 1)
+                    self.file_extensions = settings.get("file_extensions", "")
+                    self.skip_existing_files = settings.get("skip_existing_files", False)
         except Exception as e:
             self.show_error(f"Error loading settings: {e}")
 
@@ -179,6 +421,9 @@ class MyrientDownloader(App):
             settings = {
                 "destination_folder": self.destination_folder,
                 "last_url": self.current_url,
+                "concurrent_downloads": self.concurrent_downloads,
+                "file_extensions": self.file_extensions,
+                "skip_existing_files": self.skip_existing_files,
             }
             with open(SETTINGS_FILE, "w") as f:
                 json.dump(settings, f, indent=4)
@@ -406,13 +651,68 @@ class MyrientDownloader(App):
                 return
 
     def action_open_settings(self):
-        def set_dest(new_dest):
-            if new_dest:
+        def set_settings(result):
+            if result:
+                new_dest, new_concurrent, new_extensions, new_skip_existing = result
                 self.destination_folder = new_dest
+                self.concurrent_downloads = new_concurrent
+                self.file_extensions = new_extensions
+                self.skip_existing_files = new_skip_existing
                 self.save_settings()
-                self.notify(f"Destination set to: {self.destination_folder}")
+                self.notify(f"Settings saved. Destination: {self.destination_folder}")
 
-        self.push_screen(SettingsScreen(self.destination_folder), set_dest)
+        self.push_screen(SettingsScreen(self.destination_folder, self.concurrent_downloads, self.file_extensions, self.skip_existing_files), set_settings)
+
+    def action_open_search(self):
+        """Open search to find files recursively."""
+        def do_search(result):
+            if result and isinstance(result, tuple) and result[0] == "search":
+                pattern, scope = result[1], result[2]
+                import fnmatch
+
+                # Detect if user typed a glob pattern or plain text
+                has_glob = any(c in pattern for c in '*?[')
+
+                def matches(name, pattern):
+                    if has_glob:
+                        return fnmatch.fnmatch(name.lower(), pattern.lower())
+                    else:
+                        return pattern.lower() in name.lower()
+
+                def search_directory(url, pattern, recursive=False):
+                    results = []
+                    try:
+                        response = requests.get(url, timeout=30)
+                        response.raise_for_status()
+                        items = self.parse_directory_html(response.text, url)
+
+                        for name, is_dir, file_url, size in items:
+                            if matches(name, pattern):
+                                # Store parent URL so we can navigate to the directory
+                                results.append((name, file_url, url))
+
+                            if is_dir and (recursive or scope == "all"):
+                                sub_results = search_directory(file_url, pattern, recursive=recursive)
+                                results.extend(sub_results)
+
+                    except Exception as e:
+                        self.show_error(f"Error searching {url}: {e}")
+
+                    return results
+
+                search_results = search_directory(self.current_url, pattern, scope == "recursive" or scope == "all")
+
+                if search_results:
+                    self.notify(f"Found {len(search_results)} matching files/folders!")
+                    name, file_url, parent_url = search_results[0]
+                    # Navigate to the parent directory containing the result
+                    self.current_url = parent_url
+                    self.load_directory_worker(self.current_url)
+                    self.notify(f"Result 1 of {len(search_results)}: {name}")
+                else:
+                    self.notify("No matching files found")
+
+        self.push_screen(SearchScreen(self.current_url), do_search)
 
     def action_download_folder(self):
         if self.is_downloading:
@@ -447,6 +747,142 @@ class MyrientDownloader(App):
         session.mount("https://", adapter)
         return session
 
+    def get_thread_local_session(self):
+        """Get or create a thread-local session for concurrent downloads."""
+        if not hasattr(self._thread_local, 'session') or self._thread_local.session is None:
+            self._thread_local.session = self.get_retry_session()
+        return self._thread_local.session
+
+    def should_download_file(self, filename):
+        """Check if file should be downloaded based on extension filter."""
+        if not self.file_extensions:
+            return True
+        allowed_extensions = [ext.strip().lower().lstrip('.') for ext in self.file_extensions.split(',')]
+        allowed_extensions = [ext for ext in allowed_extensions if ext]
+        if not allowed_extensions:
+            return True
+        file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
+        return file_ext in allowed_extensions
+
+    def clear_download_widgets(self):
+        """Clear all download progress widgets."""
+        try:
+            scroll = self.query_one("#download-progress-scroll", ScrollableContainer)
+            scroll.remove_children()
+            self.download_widgets.clear()
+        except Exception:
+            pass
+
+    def add_download_widget(self, filename, total_size=0):
+        """Add a download progress widget."""
+        def create_widget():
+            from textual.widgets import Static
+            scroll = self.query_one("#download-progress-scroll", ScrollableContainer)
+            widget = DownloadProgressItem(filename, total_size)
+            scroll.mount(widget)
+            self.download_widgets[filename] = widget
+        self.app.call_from_thread(create_widget)
+
+    def mark_download_complete(self, filename, success=True, error=None, skipped=False):
+        """Mark a download as complete, failed, or skipped."""
+        if filename in self.download_widgets:
+            widget = self.download_widgets[filename]
+            if skipped:
+                widget.mark_skipped()
+            elif success:
+                widget.mark_completed()
+            else:
+                widget.mark_failed(error or "Unknown error")
+
+    def download_single_file(self, file_info, worker, max_retries=3):
+        """Download a single file - used by both sequential and concurrent modes."""
+        name, url = file_info
+        session = self.get_thread_local_session()
+        
+        if not url.startswith(BASE_URL):
+            return False, name, "Invalid URL", 0
+        
+        rel_path = url[len(BASE_URL):]
+        rel_path = unquote(rel_path)
+        filepath = os.path.join(self.destination_folder, rel_path)
+        
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        if self.skip_existing_files and os.path.exists(filepath):
+            # Check if the file is actually complete before skipping
+            try:
+                head_resp = session.head(url, allow_redirects=True, timeout=30)
+                remote_size = int(head_resp.headers.get("content-length", 0))
+                local_size = os.path.getsize(filepath)
+                if remote_size > 0 and local_size >= remote_size:
+                    return "skipped", name, "File already exists", local_size
+                # File is partial — fall through to resume download
+            except Exception:
+                # Can't verify, skip to be safe
+                return "skipped", name, "File already exists", os.path.getsize(filepath)
+
+        retry_key = url
+        with self.download_lock:
+            if retry_key not in self.retry_counts:
+                self.retry_counts[retry_key] = 0
+        
+        for attempt in range(max_retries):
+            try:
+                resume_header = {}
+                mode = "wb"
+                downloaded = 0
+                
+                if os.path.exists(filepath):
+                    downloaded = os.path.getsize(filepath)
+                    try:
+                        head_resp = session.head(url, allow_redirects=True, timeout=30)
+                        total_size = int(head_resp.headers.get("content-length", 0))
+                        if downloaded >= total_size and total_size > 0:
+                            return True, name, None, total_size
+                        if downloaded > 0:
+                            resume_header = {"Range": f"bytes={downloaded}-"}
+                            mode = "ab"
+                    except Exception:
+                        pass
+                
+                with session.get(url, stream=True, headers=resume_header, timeout=30) as r:
+                    r.raise_for_status()
+                    if r.status_code != 206:
+                        mode = "wb"
+                        downloaded = 0
+                    total_length = int(r.headers.get("content-length", 0))
+                    if mode == "ab":
+                        total_length += downloaded
+                    
+                    with open(filepath, mode) as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if worker.is_cancelled:
+                                return False, name, "Cancelled", downloaded
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if self.concurrent_downloads > 1 and name in self.download_widgets:
+                                    try:
+                                        self.app.call_from_thread(
+                                            self.download_widgets[name].update_progress,
+                                            downloaded,
+                                            total_length
+                                        )
+                                    except Exception:
+                                        pass
+                
+                return True, name, None, total_length
+            except Exception as e:
+                with self.download_lock:
+                    self.retry_counts[retry_key] += 1
+                if attempt == max_retries - 1:
+                    return False, name, str(e), downloaded
+                else:
+                    time.sleep(1)
+                    continue
+        
+        return False, name, "Max retries exceeded", 0
+
     @work(thread=True, exclusive=True)
     def start_download_worker(self):
         self.is_downloading = True
@@ -460,6 +896,8 @@ class MyrientDownloader(App):
             worker = get_current_worker()
             session = self.get_retry_session()
 
+            # Phase 1: Scan directories to build flat file list
+            file_list = []
             while queue:
                 if worker.is_cancelled:
                     return
@@ -468,7 +906,7 @@ class MyrientDownloader(App):
 
                 if is_dir:
                     scan_path = (
-                        unquote(url[len(BASE_URL) :])
+                        unquote(url[len(BASE_URL):])
                         if url.startswith(BASE_URL)
                         else url
                     )
@@ -477,96 +915,118 @@ class MyrientDownloader(App):
                         response = session.get(url, timeout=30)
                         response.raise_for_status()
                         items = self.parse_directory_html(response.text, url)
-                        # Add to queue
                         for item_name, item_is_dir, item_url, _ in items:
                             queue.append((item_name, item_is_dir, item_url))
                     except Exception as e:
                         self.show_error(f"Error scanning {name}: {e}")
                     continue
 
-                # It is a file
-                status_label.update(Text(f"Downloading: {name} (Queue: {len(queue)})"))
-
-                # Calculate path based on URL
-                if not url.startswith(BASE_URL):
+                # Apply extension filter
+                if not self.should_download_file(name):
                     continue
 
-                rel_path = url[len(BASE_URL) :]
-                rel_path = unquote(rel_path)
-                filepath = os.path.join(self.destination_folder, rel_path)
+                file_list.append((name, url))
 
-                # Ensure dir exists
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            if not file_list:
+                self.is_downloading = False
+                self.query_one("#status-bar").remove_class("downloading")
+                progress_bar.display = False
+                status_label.update("Ready")
+                self.notify("No files to download.")
+                return
 
-                # Retry loop for file download
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        # Resume logic
-                        resume_header = {}
-                        mode = "wb"
-                        downloaded = 0
+            self.total_files_to_download = len(file_list)
+            self.files_completed = 0
+            self.files_failed = 0
+            self.files_skipped = 0
 
-                        if os.path.exists(filepath):
-                            downloaded = os.path.getsize(filepath)
-                            try:
-                                head_resp = session.head(
-                                    url, allow_redirects=True, timeout=30
-                                )
-                                total_size = int(
-                                    head_resp.headers.get("content-length", 0)
-                                )
+            status_label.update(Text(f"Downloading {len(file_list)} files..."))
 
-                                if downloaded >= total_size and total_size > 0:
-                                    # Already done
-                                    break
+            # Phase 2: Download files
+            max_workers = max(1, self.concurrent_downloads)
 
-                                if downloaded > 0:
-                                    resume_header = {"Range": f"bytes={downloaded}-"}
-                                    mode = "ab"
-                            except:
-                                pass
+            if max_workers > 1:
+                # Concurrent downloads
+                self.app.call_from_thread(self.add_class, "concurrent-downloading")
+                self.app.call_from_thread(self.clear_download_widgets)
 
-                        with session.get(
-                            url, stream=True, headers=resume_header, timeout=30
-                        ) as r:
-                            r.raise_for_status()
+                for name, url in file_list:
+                    self.add_download_widget(name)
 
-                            # Check if range was accepted
-                            if r.status_code != 206:
-                                mode = "wb"
-                                downloaded = 0
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {}
+                    for file_info in file_list:
+                        if worker.is_cancelled:
+                            break
+                        future = executor.submit(self.download_single_file, file_info, worker)
+                        futures[future] = file_info
 
-                            total_length = int(r.headers.get("content-length", 0))
+                    for future in as_completed(futures):
+                        if worker.is_cancelled:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            return
 
-                            if mode == "ab":
-                                total_length += downloaded
+                        file_info = futures[future]
+                        try:
+                            result = future.result()
+                            status, name, error, size = result
 
-                            progress_bar.update(total=total_length, progress=downloaded)
+                            if status == "skipped":
+                                with self.download_lock:
+                                    self.files_skipped += 1
+                                self.app.call_from_thread(self.mark_download_complete, name, skipped=True)
+                            elif status:
+                                with self.download_lock:
+                                    self.files_completed += 1
+                                self.app.call_from_thread(self.mark_download_complete, name, success=True)
 
-                            with open(filepath, mode) as f:
-                                for chunk in r.iter_content(chunk_size=8192):
-                                    if worker.is_cancelled:
-                                        return
-                                    if chunk:
-                                        f.write(chunk)
-                                        downloaded += len(chunk)
-                                        progress_bar.update(progress=downloaded)
+                            else:
+                                with self.download_lock:
+                                    self.files_failed += 1
+                                self.app.call_from_thread(self.mark_download_complete, name, success=False, error=error)
 
-                        # Success
-                        break
-                    except Exception as e:
-                        if attempt == max_retries - 1:
-                            self.show_error(f"Failed to download {name}: {e}")
-                        else:
-                            time.sleep(1)
-                            continue
+
+                        except Exception as e:
+                            with self.download_lock:
+                                self.files_failed += 1
+                            self.app.call_from_thread(self.mark_download_complete, file_info[0], success=False, error=str(e))
+
+                        done = self.files_completed + self.files_failed + self.files_skipped
+                        self._update_status_label(
+                            f"Progress: {done}/{self.total_files_to_download} "
+                            f"({self.files_completed} done, {self.files_failed} failed, {self.files_skipped} skipped)"
+                        )
+
+                self.app.call_from_thread(self.remove_class, "concurrent-downloading")
+
+            else:
+                # Sequential downloads (original behavior)
+                for i, (name, url) in enumerate(file_list):
+                    if worker.is_cancelled:
+                        return
+
+                    status_label.update(Text(f"Downloading ({i+1}/{len(file_list)}): {name}"))
+
+                    result = self.download_single_file((name, url), worker)
+                    status, fname, error, size = result
+
+                    if status == "skipped":
+                        self.files_skipped += 1
+                    elif status:
+                        self.files_completed += 1
+                        progress_bar.update(total=len(file_list), progress=i + 1)
+                    else:
+                        self.files_failed += 1
+                        self.show_error(f"Failed: {name}: {error}")
 
             self.is_downloading = False
             self.query_one("#status-bar").remove_class("downloading")
             progress_bar.display = False
             status_label.update("Ready")
-            self.notify("Download finished!")
+            self.notify(
+                f"Done! {self.files_completed} downloaded, "
+                f"{self.files_failed} failed, {self.files_skipped} skipped"
+            )
 
         except Exception as e:
             self.show_error(f"Download worker crashed: {e}")
@@ -576,7 +1036,7 @@ class MyrientDownloader(App):
             status_label.update("Error")
 
     def stop_download(self):
-        # Cancel the worker
+        """Cancel the download worker."""
         self.workers.cancel_all()
         self.is_downloading = False
         self.query_one("#status-bar").remove_class("downloading")

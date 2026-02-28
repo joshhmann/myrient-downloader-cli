@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="myrient-downloader-cli",
-    version="0.4.0",
+    version="0.5.0",
     py_modules=["myrient"],
     install_requires=[
         "requests==2.32.3",
