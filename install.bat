@@ -43,6 +43,22 @@ if exist "%INSTALL_DIR%" (
     cd /d "%INSTALL_DIR%"
 )
 
+:: Check for rclone
+where rclone >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [!] rclone not found. Required for Turbo Mode.
+    echo [+] Attempting to install rclone via winget...
+    winget install rclone --silent --accept-package-agreements --accept-source-agreements
+    if %errorlevel% neq 0 (
+        echo [ERROR] winget failed to install rclone.
+        echo Please install it manually: https://rclone.org/downloads/
+    ) else (
+        echo [+] rclone installed successfully.
+    )
+) else (
+    for /f "tokens=*" %%i in ('rclone version ^| findstr rclone') do echo [+] Found %%i
+)
+
 :: Install dependencies
 echo [+] Installing dependencies...
 python -m pip install -r requirements.txt --quiet

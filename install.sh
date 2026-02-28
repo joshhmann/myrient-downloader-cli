@@ -50,6 +50,55 @@ else
     cd "$INSTALL_DIR"
 fi
 
+# Check for rclone
+RCLONE_LOCAL_DIR="$INSTALL_DIR/bin"
+mkdir -p "$RCLONE_LOCAL_DIR"
+
+if ! command -v rclone &>/dev/null && [ ! -f "$RCLONE_LOCAL_DIR/rclone" ]; then
+    echo "[!] rclone not found. Downloading standalone binary for Turbo Mode..."
+    
+    OS="$(uname | tr '[:upper:]' '[:lower:]')"
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+        x86_64) ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        armv7*) ARCH="arm" ;;
+        i386|i686) ARCH="386" ;;
+        *) ARCH="amd64" ;;
+    esac
+
+    RCLONE_ZIP="rclone-current-$OS-$ARCH.zip"
+    RCLONE_URL="https://downloads.rclone.org/$RCLONE_ZIP"
+
+    echo "[+] Downloading rclone ($OS-$ARCH)..."
+    if command -v curl &>/dev/null; then
+        curl -L -o "/tmp/$RCLONE_ZIP" "$RCLONE_URL"
+    elif command -v wget &>/dev/null; then
+        wget -O "/tmp/$RCLONE_ZIP" "$RCLONE_URL"
+    else
+        echo "[ERROR] curl or wget not found. Please install rclone manually."
+        exit 1
+    fi
+
+    echo "[+] Extracting rclone..."
+    if command -v unzip &>/dev/null; then
+        unzip -q "/tmp/$RCLONE_ZIP" -d "/tmp/rclone-extract"
+        find "/tmp/rclone-extract" -name rclone -type f -exec mv {} "$RCLONE_LOCAL_DIR/rclone" \;
+        chmod +x "$RCLONE_LOCAL_DIR/rclone"
+        rm -rf "/tmp/$RCLONE_ZIP" "/tmp/rclone-extract"
+        echo "[+] rclone installed locally to $RCLONE_LOCAL_DIR/rclone"
+    else
+        echo "[ERROR] unzip not found. Please install unzip or rclone manually."
+        exit 1
+    fi
+else
+    if command -v rclone &>/dev/null; then
+        echo "[+] Found system rclone: $(rclone version | head -n 1)"
+    else
+        echo "[+] Found local rclone: $($RCLONE_LOCAL_DIR/rclone version | head -n 1)"
+    fi
+fi
+
 # Install dependencies
 echo "[+] Installing dependencies..."
 $PYTHON -m pip install -r requirements.txt --quiet

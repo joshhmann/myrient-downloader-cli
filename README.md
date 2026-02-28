@@ -7,22 +7,17 @@ Browse the Myrient file repository directly from your terminal and download file
 ## Features
 
 - **Terminal User Interface**: Clean TUI with mouse and keyboard support.
-- **Concurrent Downloads**: Download multiple files at once (configurable: 1, 3, 5, 10, or 20 simultaneous downloads).
-- **Resume & Continue**: Automatically resumes interrupted downloads. Re-run a folder download and it picks up where it left off — complete files are skipped, partial files are resumed.
+- **Turbo Mode (rclone)**: Use [rclone](https://rclone.org/) as the download engine for maximum speed on folder downloads.
+- **Concurrent Downloads**: Download multiple files at once using Python-native or Turbo mode.
+- **Resume & Continue**: Automatically resumes interrupted downloads. Complete files are skipped.
 - **Recursive Download**: Download entire folders and their subfolders with a single keypress.
-- **File Search**: Search for files and folders by name across the current directory, subdirectories, or the entire site. Supports substring matching and glob patterns (`*.zip`, `snes*`).
+- **File Search**: Search for files and folders by name across the current directory or the entire site.
 - **Extension Filter**: Only download specific file types (e.g., `zip,7z,iso`).
-- **Skip Existing**: Intelligently skips already-downloaded files by verifying completeness against the server.
-- **Smart Navigation**: Type-ahead search to quickly jump to items in the current listing.
-- **Progress Tracking**: Real-time progress bars — per-file progress widgets for concurrent downloads.
-- **Settings Persistence**: Saves all preferences (destination, concurrent count, filters) to `settings.json`.
+- **Settings Persistence**: Saves all preferences (destination, turbo mode, rclone path) to `settings.json`.
 
 ## Installation
 
-### Requirements
-
-- Python 3.8+
-- git
+The installer now automatically attempts to install `rclone` if it's not found on your system.
 
 ### Linux / macOS
 
@@ -30,23 +25,9 @@ Browse the Myrient file repository directly from your terminal and download file
 curl -fsSL https://raw.githubusercontent.com/joshhmann/myrient-downloader-cli/master/install.sh | bash
 ```
 
-Or manually:
-
-```bash
-git clone https://github.com/joshhmann/myrient-downloader-cli.git ~/.myrient-cli
-cd ~/.myrient-cli
-pip install -r requirements.txt
-```
-
 ### Windows
 
-Download and run `install.bat` from the repository, or manually:
-
-```bash
-git clone https://github.com/joshhmann/myrient-downloader-cli.git %USERPROFILE%\.myrient-cli
-cd %USERPROFILE%\.myrient-cli
-pip install -r requirements.txt
-```
+Download and run `install.bat` from the repository.
 
 ## Usage
 
@@ -56,11 +37,17 @@ After installation:
 myrient-cli
 ```
 
-Or run directly:
+### Turbo Mode (High Speed)
 
-```bash
-python myrient.py
-```
+For the best performance, enable **Turbo Mode** in the settings:
+
+1. Press `?` to open Settings.
+2. Toggle **Turbo (rclone)** to **On**.
+3. Ensure the **Rclone Path** is correct (usually `rclone` or the full path to the executable).
+4. Save settings.
+5. Navigate to a folder and press `Ctrl+D`.
+
+Turbo Mode uses `rclone`'s high-concurrency engine to bypass Python's speed limitations.
 
 ### Controls
 

@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -28,38 +29,62 @@ from textual.widgets import (
     Input,
     Label,
     ProgressBar,
+    Static,
 )
 from textual.worker import get_current_worker
 from urllib3.util.retry import Retry
 
 BASE_URL = "https://myrient.erista.me/files/"
 SETTINGS_FILE = "settings.json"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 class SettingsScreen(ModalScreen):
     BINDINGS = [("escape", "close_settings", "Close")]
 
-    def __init__(self, current_dest, current_concurrent=1, current_extensions="", current_skip_existing=False):
+    def __init__(self, current_dest, current_concurrent=8, current_extensions="", current_skip_existing=False, current_rclone_path="rclone", current_use_turbo=False, current_rclone_remote=":http:"):
         super().__init__()
         self.current_dest = current_dest
         self.current_concurrent = current_concurrent
         self.current_extensions = current_extensions
         self.current_skip_existing = current_skip_existing
+        self.current_rclone_path = current_rclone_path
+        self.current_use_turbo = current_use_turbo
+        self.current_rclone_remote = current_rclone_remote
 
     def compose(self) -> ComposeResult:
         with Container(id="settings-dialog"):
             yield Label("Settings", id="settings-title")
             yield Label("Destination Folder:")
-            yield Input(value=self.current_dest, id="dest-input")
-            yield Label("Concurrent Downloads:")
-            yield Select(
-                [("Sequential (1)", 1), ("3 files", 3), ("5 files", 5), ("10 files", 10), ("20 files", 20)],
-                value=self.current_concurrent,
-                id="concurrent-select"
-            )
-            yield Label("File Extensions (comma-separated, e.g., zip,7z,iso):")
+            yield Input(value=str(self.current_dest), id="dest-input")
+            
+            with Horizontal():
+                with Vertical():
+                    yield Label("Concurrent (Python):")
+                    yield Select(
+                        [("1", 1), ("5", 5), ("8", 8), ("16", 16), ("20", 20), ("32", 32)],
+                        value=self.current_concurrent if self.current_concurrent in [1, 5, 8, 16, 20, 32] else 8,
+                        id="concurrent-select"
+                    )
+                with Vertical():
+                    yield Label("Turbo (rclone):")
+                    yield Select(
+                        [("Off", False), ("On", True)],
+                        value=self.current_use_turbo,
+                        id="turbo-select"
+                    )
+
+            with Horizontal():
+                with Vertical():
+                    yield Label("Rclone Path:")
+                    yield Input(value=str(self.current_rclone_path), id="rclone-path-input")
+                with Vertical():
+                    yield Label("Rclone Remote:")
+                    yield Input(value=str(self.current_rclone_remote), id="rclone-remote-input", placeholder=":http: or myrient:")
+
+            yield Label("File Extensions (e.g., zip,7z):")
             yield Input(value=self.current_extensions, id="extensions-input")
+            
             yield Label("Skip Existing Files:")
             yield Select(
                 [("No", False), ("Yes", True)],
@@ -76,7 +101,10 @@ class SettingsScreen(ModalScreen):
             new_concurrent = self.query_one("#concurrent-select", Select).value
             new_extensions = self.query_one("#extensions-input", Input).value
             new_skip_existing = self.query_one("#skip-existing-select", Select).value
-            self.dismiss((new_dest, new_concurrent, new_extensions, new_skip_existing))
+            new_rclone_path = self.query_one("#rclone-path-input", Input).value
+            new_use_turbo = self.query_one("#turbo-select", Select).value
+            new_rclone_remote = self.query_one("#rclone-remote-input", Input).value
+            self.dismiss((new_dest, new_concurrent, new_extensions, new_skip_existing, new_rclone_path, new_use_turbo, new_rclone_remote))
         else:
             self.dismiss(None)
 
@@ -188,9 +216,12 @@ class MyrientDownloader(App):
 
     current_url = reactive(BASE_URL)
     destination_folder = reactive(os.getcwd())
-    concurrent_downloads = reactive(1)
+    concurrent_downloads = reactive(8)
     file_extensions = reactive("")
     skip_existing_files = reactive(False)
+    rclone_path = reactive("rclone")
+    rclone_remote = reactive(":http:")
+    use_turbo = reactive(False)
     download_queue = []
     is_downloading = reactive(False)
     is_loading_dir = reactive(False)
@@ -263,6 +294,16 @@ class MyrientDownloader(App):
 
     def load_settings(self):
         try:
+            # Default rclone path check
+            default_rclone = "rclone"
+            local_rclone = os.path.join(os.path.dirname(__file__), "bin", "rclone")
+            if os.path.exists(local_rclone):
+                default_rclone = local_rclone
+            elif sys.platform == "win32":
+                local_rclone_win = os.path.join(os.path.dirname(__file__), "bin", "rclone.exe")
+                if os.path.exists(local_rclone_win):
+                    default_rclone = local_rclone_win
+
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE, "r") as f:
                     settings = json.load(f)
@@ -272,9 +313,14 @@ class MyrientDownloader(App):
                         dest = dest[0] if len(dest) > 0 else os.getcwd()
                     self.destination_folder = dest
                     self.current_url = settings.get("last_url", BASE_URL)
-                    self.concurrent_downloads = settings.get("concurrent_downloads", 1)
+                    self.concurrent_downloads = settings.get("concurrent_downloads", 8)
                     self.file_extensions = settings.get("file_extensions", "")
                     self.skip_existing_files = settings.get("skip_existing_files", False)
+                    self.rclone_path = settings.get("rclone_path", default_rclone)
+                    self.rclone_remote = settings.get("rclone_remote", ":http:")
+                    self.use_turbo = settings.get("use_turbo", False)
+            else:
+                self.rclone_path = default_rclone
         except Exception as e:
             self.show_error(f"Error loading settings: {e}")
 
@@ -286,6 +332,9 @@ class MyrientDownloader(App):
                 "concurrent_downloads": self.concurrent_downloads,
                 "file_extensions": self.file_extensions,
                 "skip_existing_files": self.skip_existing_files,
+                "rclone_path": self.rclone_path,
+                "rclone_remote": self.rclone_remote,
+                "use_turbo": self.use_turbo,
             }
             with open(SETTINGS_FILE, "w") as f:
                 json.dump(settings, f, indent=4)
@@ -511,15 +560,18 @@ class MyrientDownloader(App):
     def action_open_settings(self):
         def set_settings(result):
             if result:
-                new_dest, new_concurrent, new_extensions, new_skip_existing = result
+                new_dest, new_concurrent, new_extensions, new_skip_existing, new_rclone, new_turbo, new_remote = result
                 self.destination_folder = new_dest
                 self.concurrent_downloads = new_concurrent
                 self.file_extensions = new_extensions
                 self.skip_existing_files = new_skip_existing
+                self.rclone_path = new_rclone
+                self.use_turbo = new_turbo
+                self.rclone_remote = new_remote
                 self.save_settings()
                 self.notify(f"Settings saved. Destination: {self.destination_folder}")
 
-        self.push_screen(SettingsScreen(self.destination_folder, self.concurrent_downloads, self.file_extensions, self.skip_existing_files), set_settings)
+        self.push_screen(SettingsScreen(self.destination_folder, self.concurrent_downloads, self.file_extensions, self.skip_existing_files, self.rclone_path, self.use_turbo, self.rclone_remote), set_settings)
 
     def action_open_search(self):
         """Open search to find files recursively."""
@@ -583,6 +635,11 @@ class MyrientDownloader(App):
             self.notify("Already downloading!", severity="warning")
             return
 
+        # Turbo Mode (rclone)
+        if self.use_turbo:
+            self._run_rclone_folder(self.current_url)
+            return
+
         # Collect all items in current view (files AND dirs)
         items_to_process = []
         # We can use self.row_data
@@ -596,6 +653,86 @@ class MyrientDownloader(App):
 
         self.download_queue = items_to_process
         self.start_download_worker()
+
+    @work(thread=True, exclusive=True)
+    def _run_rclone_folder(self, url):
+        """Execute rclone turbo download."""
+        self.is_downloading = True
+        self.query_one("#status-bar").add_class("downloading")
+        self._update_status_label("Turbo Mode: Initializing rclone...")
+
+        try:
+            # 1. Calculate relative path from BASE_URL
+            rel_path_raw = url[len(BASE_URL):]
+            rel_path_unquoted = unquote(rel_path_raw)
+            
+            # 2. Construct Source (handle remote syntax)
+            remote = self.rclone_remote.strip()
+            if not remote.endswith(":"):
+                remote += ":"
+            source = f"{remote}{rel_path_raw}"
+            
+            # 3. Construct Destination (Windows-safe)
+            dest = self.destination_folder
+            if rel_path_unquoted:
+                # Remove trailing slashes and normalize separators for the OS
+                sub_path = rel_path_unquoted.strip("/").strip("\\").replace("/", os.sep)
+                dest = os.path.join(dest, sub_path)
+            
+            os.makedirs(dest, exist_ok=True)
+
+            cmd = [
+                self.rclone_path,
+                "copy",
+                source,
+                dest,
+                "--progress",
+                "--http-no-head",
+                "--transfers", "16",
+                "--checkers", "32",
+                "--stats", "1s",
+                "--stats-one-line",
+                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--buffer-size", "32M",
+                "-v"
+            ]
+
+            if remote == ":http:":
+                cmd.extend(["--http-url", BASE_URL])
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+
+            last_lines = []
+            for line in process.stdout:
+                line_str = line.strip()
+                if line_str:
+                    last_lines.append(line_str)
+                    if len(last_lines) > 5:
+                        last_lines.pop(0)
+                        
+                if "Transferred:" in line or "ETA" in line:
+                    self._update_status_label(f"Turbo: {line_str}")
+            
+            process.wait()
+
+            if process.returncode == 0:
+                self.notify("Turbo Download Complete!")
+            else:
+                error_msg = last_lines[-1] if last_lines else "Unknown error"
+                self.show_error(f"Rclone Failed: {error_msg}")
+
+        except Exception as e:
+            self.show_error(f"Turbo Mode Error: {e}")
+        finally:
+            self.is_downloading = False
+            self.query_one("#status-bar").remove_class("downloading")
+            self._update_status_label("Ready")
 
     def get_retry_session(self, retries=5, backoff_factor=0.5):
         session = requests.Session()
@@ -642,46 +779,45 @@ class MyrientDownloader(App):
         
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
-        if self.skip_existing_files and os.path.exists(filepath):
-            local_size = os.path.getsize(filepath)
-            if local_size > 0:
-                return "skipped", name, "File already exists", local_size
+        local_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+        if self.skip_existing_files and local_size > 0:
+            return "skipped", name, "File already exists", local_size
 
         retry_key = url
         with self.download_lock:
             if retry_key not in self.retry_counts:
                 self.retry_counts[retry_key] = 0
         
+        downloaded = local_size
         for attempt in range(max_retries):
             try:
-                resume_header = {}
-                mode = "wb"
-                downloaded = 0
-                
-                if os.path.exists(filepath):
-                    downloaded = os.path.getsize(filepath)
-                    try:
-                        head_resp = session.head(url, allow_redirects=True, timeout=(10, 15))
-                        total_size = int(head_resp.headers.get("content-length", 0))
-                        if downloaded >= total_size and total_size > 0:
-                            return True, name, None, total_size
-                        if downloaded > 0:
-                            resume_header = {"Range": f"bytes={downloaded}-"}
-                            mode = "ab"
-                    except Exception:
-                        pass
+                resume_header = {"Range": f"bytes={local_size}-"} if local_size > 0 else {}
                 
                 with session.get(url, stream=True, headers=resume_header, timeout=(10, 30)) as r:
+                    if r.status_code == 416:
+                        # Might be finished, verify with one HEAD as fallback
+                        head_resp = session.head(url, allow_redirects=True, timeout=(10, 15))
+                        total_size = int(head_resp.headers.get("content-length", 0))
+                        if local_size >= total_size:
+                            return True, name, None, total_size
+                        local_size = 0
+                        continue
+
                     r.raise_for_status()
-                    if r.status_code != 206:
+                    
+                    if r.status_code == 200:
+                        local_size = 0
                         mode = "wb"
-                        downloaded = 0
+                    else:
+                        mode = "ab" if local_size > 0 else "wb"
+                        
                     total_length = int(r.headers.get("content-length", 0))
                     if mode == "ab":
-                        total_length += downloaded
+                        total_length += local_size
                     
+                    downloaded = local_size
                     with open(filepath, mode) as f:
-                        for chunk in r.iter_content(chunk_size=65536):
+                        for chunk in r.iter_content(chunk_size=131072):
                             if worker.is_cancelled:
                                 return False, name, "Cancelled", downloaded
                             if chunk:
@@ -765,7 +901,7 @@ class MyrientDownloader(App):
             except Exception as e:
                 self._show_error_safe(f"Error scanning {dir_name}: {e}")
 
-        SCAN_WORKERS = 5
+        SCAN_WORKERS = 16
         with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
             futures = set()
 
