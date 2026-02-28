@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1252,6 +1253,7 @@ class MyrientDownloader(App):
             last_lines = []
             files_done = 0
             copied_files = set()
+            transferred_count_re = re.compile(r"Transferred:\s*([\d,]+)\s*/\s*([\d,]+)")
             if process.stdout is not None:
                 for raw_line in process.stdout:
                     if worker.is_cancelled:
@@ -1277,6 +1279,11 @@ class MyrientDownloader(App):
                         short = fname.rsplit("/", 1)[-1] if fname else ""
                         self._update_status_label(f"Turbo [{files_done}] done: {short}")
                     elif "Transferred:" in line_str or "Checks:" in line_str:
+                        match = transferred_count_re.search(line_str)
+                        if match:
+                            # rclone stats lines are the most reliable count for large folders.
+                            transferred_count = int(match.group(1).replace(",", ""))
+                            files_done = max(files_done, transferred_count)
                         self._update_status_label(f"Turbo [{files_done} done] {line_str[:120]}")
                     elif "nothing to transfer" in line_str.lower():
                         self._update_status_label("Turbo: nothing to transfer (all files already present)")
