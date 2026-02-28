@@ -46,12 +46,12 @@ LARGE_FILE_MIN_BYTES = 1024 * 1024 * 1024
 DEFAULT_LARGE_FILE_PARALLEL_LIMIT = 3
 MANIFEST_FILENAME = ".myrient-downloaded.jsonl"
 CONCURRENCY_GOVERNOR_MAP = {
-    1: {"python_rps": 2.0, "rclone_rps": 2.0, "large_parallel": 1},
-    5: {"python_rps": 8.0, "rclone_rps": 8.0, "large_parallel": 2},
-    8: {"python_rps": 12.0, "rclone_rps": 12.0, "large_parallel": 3},
-    16: {"python_rps": 20.0, "rclone_rps": 20.0, "large_parallel": 4},
-    20: {"python_rps": 26.0, "rclone_rps": 26.0, "large_parallel": 5},
-    32: {"python_rps": 40.0, "rclone_rps": 40.0, "large_parallel": 5},
+    1: {"python_rps": 8.0, "rclone_rps": 0.0, "large_parallel": 1},
+    5: {"python_rps": 40.0, "rclone_rps": 0.0, "large_parallel": 2},
+    8: {"python_rps": 60.0, "rclone_rps": 0.0, "large_parallel": 3},
+    16: {"python_rps": 100.0, "rclone_rps": 0.0, "large_parallel": 4},
+    20: {"python_rps": 140.0, "rclone_rps": 0.0, "large_parallel": 5},
+    32: {"python_rps": 220.0, "rclone_rps": 0.0, "large_parallel": 5},
 }
 
 
@@ -446,8 +446,8 @@ class MyrientDownloader(App):
 
     def _derive_rclone_workers(self):
         concurrency = max(1, int(self.concurrent_downloads))
-        transfers = max(1, min(concurrency, 32))
-        checkers = max(4, min(transfers * 2, 64))
+        transfers = max(4, min(concurrency * 2, 64))
+        checkers = max(8, min(transfers * 2, 128))
         return transfers, checkers
 
     def _get_manifest_path(self):
@@ -523,15 +523,17 @@ class MyrientDownloader(App):
             return default
 
     def _update_rate_indicator(self, observed_rps=None, active=False):
+        rclone_cap_text = "off" if float(self.rclone_tps_limit) <= 0 else f"{self.rclone_tps_limit:.1f}/s"
+        http_cap_text = "off" if float(self.max_requests_per_second) <= 0 else f"{self.max_requests_per_second:.1f}/s"
         base = (
-            f"HTTP cap {self.max_requests_per_second:.1f}/s | "
-            f"rclone cap {self.rclone_tps_limit:.1f}/s | "
+            f"HTTP cap {http_cap_text} | "
+            f"rclone cap {rclone_cap_text} | "
             f"large>=1GB x{self.large_file_parallel_limit}"
         )
         if active and observed_rps is not None:
             base = (
-                f"HTTP now ~{observed_rps:.1f}/s (cap {self.max_requests_per_second:.1f}/s) | "
-                f"rclone cap {self.rclone_tps_limit:.1f}/s | "
+                f"HTTP now ~{observed_rps:.1f}/s (cap {http_cap_text}) | "
+                f"rclone cap {rclone_cap_text} | "
                 f"large>=1GB x{self.large_file_parallel_limit}"
             )
 
@@ -547,6 +549,8 @@ class MyrientDownloader(App):
             _update()
 
     def _wait_for_request_slot(self):
+        if float(self.max_requests_per_second) <= 0:
+            return
         min_interval = 1.0 / max(0.1, float(self.max_requests_per_second))
         with self.request_rate_lock:
             now = time.monotonic()
@@ -1196,7 +1200,6 @@ class MyrientDownloader(App):
             
             os.makedirs(dest, exist_ok=True)
             transfers, checkers = self._derive_rclone_workers()
-            tps_burst = max(1, min(int(self.rclone_tps_limit * 2), 20))
 
             cmd = [
                 self.rclone_path,
@@ -1207,15 +1210,15 @@ class MyrientDownloader(App):
                 str(transfers),
                 "--checkers",
                 str(checkers),
-                "--tpslimit", str(self.rclone_tps_limit),
-                "--tpslimit-burst",
-                str(tps_burst),
                 "--stats", "2s",
                 "--progress",
                 "--user-agent", "Mozilla/5.0",
                 "--buffer-size", "32M",
                 "-v",
             ]
+            if float(self.rclone_tps_limit) > 0:
+                tps_burst = max(1, min(int(self.rclone_tps_limit * 2), 20))
+                cmd.extend(["--tpslimit", str(self.rclone_tps_limit), "--tpslimit-burst", str(tps_burst)])
 
             if remote == ":http:":
                 cmd.extend(["--http-url", http_url_for_copy, "--http-no-head"])
