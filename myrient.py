@@ -867,44 +867,53 @@ class MyrientDownloader(App):
             if max_workers > 1:
                 # Concurrent: submit downloads as scanner finds files
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {}
+                    active = {}
+                    results_queue = queue_module.Queue()
 
-                    while not (scan_done_event.is_set() and file_queue.empty()):
+                    def _wrap_download(file_info):
+                        """Wrapper that puts results into a queue instead of requiring polling."""
+                        try:
+                            result = self.download_single_file(file_info, worker)
+                            results_queue.put((file_info, result, None))
+                        except Exception as e:
+                            results_queue.put((file_info, None, e))
+
+                    while not (scan_done_event.is_set() and file_queue.empty() and not active):
                         if worker.is_cancelled:
                             executor.shutdown(wait=False, cancel_futures=True)
                             return
 
-                        # Submit new files from queue
+                        # Submit files in batches — keep the pool full
+                        while len(active) < max_workers:
+                            try:
+                                file_info = file_queue.get_nowait()
+                                future = executor.submit(_wrap_download, file_info)
+                                active[future] = file_info
+                                _update_progress(file_info[0])
+                            except queue_module.Empty:
+                                break
+
+                        # Collect results without polling futures
                         try:
-                            file_info = file_queue.get(timeout=0.1)
-                            future = executor.submit(self.download_single_file, file_info, worker)
-                            futures[future] = file_info
-                            _update_progress(file_info[0])
+                            while True:
+                                file_info, result, error = results_queue.get_nowait()
+                                if error:
+                                    with self.download_lock:
+                                        self.files_failed += 1
+                                else:
+                                    _handle_result(file_info, result)
+                                _update_progress()
                         except queue_module.Empty:
                             pass
 
-                        # Collect completed futures
-                        done_futures = [f for f in futures if f.done()]
-                        for future in done_futures:
-                            file_info = futures.pop(future)
-                            try:
-                                _handle_result(file_info, future.result())
-                            except Exception as e:
-                                with self.download_lock:
-                                    self.files_failed += 1
-                            _update_progress()
+                        # Clean up done futures from active set
+                        done = [f for f in active if f.done()]
+                        for f in done:
+                            del active[f]
 
-                    # Wait for remaining downloads to finish
-                    for future in as_completed(futures):
-                        if worker.is_cancelled:
-                            return
-                        file_info = futures[future]
-                        try:
-                            _handle_result(file_info, future.result())
-                        except Exception as e:
-                            with self.download_lock:
-                                self.files_failed += 1
-                        _update_progress()
+                        # Brief sleep only if nothing to do right now
+                        if len(active) >= max_workers or (file_queue.empty() and active):
+                            time.sleep(0.05)
 
             else:
                 # Sequential: download files as scanner finds them
