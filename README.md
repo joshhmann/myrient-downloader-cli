@@ -15,6 +15,7 @@ Browse the Myrient file repository directly from your terminal and download file
 - **Extension Filter**: Only download specific file types (e.g., `zip,7z,iso`).
 - **Request Throttling**: Global request-rate limits for Python and Turbo mode to avoid hammering Myrient.
 - **Live Rate Indicator**: Status bar shows current HTTP request pace vs configured caps.
+- **Download Manifest**: Tracks completed files in `.myrient-downloaded.jsonl` and marks them in-browser with `✅`.
 - **Settings Persistence**: Saves all preferences (destination, turbo mode, rclone path, rate limits) to `settings.json`.
 
 ## Installation

@@ -43,6 +43,7 @@ DEFAULT_MAX_REQUESTS_PER_SECOND = 1.0
 DEFAULT_RCLONE_TPS_LIMIT = 1.0
 LARGE_FILE_MIN_BYTES = 1024 * 1024 * 1024
 DEFAULT_LARGE_FILE_PARALLEL_LIMIT = 3
+MANIFEST_FILENAME = ".myrient-downloaded.jsonl"
 
 
 class SettingsScreen(ModalScreen):
@@ -312,6 +313,9 @@ class MyrientDownloader(App):
     # Thread-local storage for sessions (each thread gets its own session)
     _thread_local = threading.local()
     large_file_semaphore = None
+    manifest_lock = threading.Lock()
+    downloaded_manifest = {}
+    manifest_path = ""
     request_rate_lock = threading.Lock()
     next_request_allowed_at = 0.0
     request_timestamps = deque()
@@ -380,6 +384,7 @@ class MyrientDownloader(App):
 
     def on_mount(self):
         self.load_settings()
+        self._load_download_manifest()
         self._update_rate_indicator()
         table = self.query_one("#file-list", DataTable)
         table.add_columns("Name", "Size")
@@ -461,6 +466,67 @@ class MyrientDownloader(App):
                 json.dump(settings, f, indent=4)
         except Exception as e:
             self.show_error(f"Error saving settings: {e}")
+
+    def _get_manifest_path(self):
+        return os.path.join(self.destination_folder, MANIFEST_FILENAME)
+
+    def _load_download_manifest(self):
+        manifest = {}
+        path = self._get_manifest_path()
+        self.manifest_path = path
+
+        if not os.path.exists(path):
+            self.downloaded_manifest = manifest
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as manifest_file:
+                for raw in manifest_file:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    url = entry.get("url")
+                    if url:
+                        manifest[url] = entry
+        except Exception as e:
+            self.show_error(f"Error loading manifest: {e}")
+            manifest = {}
+
+        self.downloaded_manifest = manifest
+
+    def _is_manifest_downloaded(self, url):
+        with self.manifest_lock:
+            entry = self.downloaded_manifest.get(url)
+        if not entry:
+            return False
+        local_path = entry.get("local_path")
+        if not local_path:
+            return True
+        return os.path.exists(local_path)
+
+    def _record_download_manifest(self, url, local_path, size_bytes=None, status="done"):
+        entry = {
+            "url": url,
+            "local_path": local_path,
+            "size_bytes": size_bytes if isinstance(size_bytes, int) else None,
+            "status": status,
+            "timestamp": int(time.time()),
+        }
+
+        with self.manifest_lock:
+            self.downloaded_manifest[url] = entry
+            target_path = self._get_manifest_path()
+            self.manifest_path = target_path
+            try:
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                with open(target_path, "a", encoding="utf-8") as manifest_file:
+                    manifest_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception as e:
+                self._show_error_safe(f"Error writing manifest: {e}")
 
     def _parse_int_setting(self, value, default, minimum=1, maximum=32):
         try:
@@ -643,6 +709,11 @@ class MyrientDownloader(App):
         except ValueError:
             return None
 
+    def _url_to_local_path(self, url):
+        rel_path = url[len(BASE_URL):] if url.startswith(BASE_URL) else os.path.basename(url)
+        rel_path = unquote(rel_path)
+        return os.path.join(self.destination_folder, rel_path.replace("/", os.sep))
+
     @work(thread=True)
     def load_directory_worker(self, url):
         self.app.call_from_thread(setattr, self, "is_loading_dir", True)
@@ -665,7 +736,11 @@ class MyrientDownloader(App):
                 self.row_data = {}  # Reset the lookup
 
                 for text_content, is_dir, full_url, size in items:
-                    icon = "📁 " if is_dir else "📄 "
+                    is_done = (not is_dir) and self._is_manifest_downloaded(full_url)
+                    if is_dir:
+                        icon = "📁 "
+                    else:
+                        icon = "✅ " if is_done else "📄 "
                     display_name = Text(icon)
                     display_name.append(text_content)
 
@@ -801,6 +876,7 @@ class MyrientDownloader(App):
                     new_large_files_parallel,
                     new_operation_mode,
                 ) = result
+                previous_dest = self.destination_folder
                 self.destination_folder = new_dest
                 self.concurrent_downloads = self._parse_int_setting(
                     new_concurrent,
@@ -830,8 +906,11 @@ class MyrientDownloader(App):
                     minimum=1,
                     maximum=5,
                 )
+                if previous_dest != self.destination_folder:
+                    self._load_download_manifest()
                 self.save_settings()
                 self._update_rate_indicator()
+                self.load_directory_worker(self.current_url)
                 self.notify(f"Settings saved. Destination: {self.destination_folder}")
 
         self.push_screen(
@@ -1004,7 +1083,7 @@ class MyrientDownloader(App):
         def run_copyurl(file_info):
             name, file_url, size_bytes = file_info
             if worker.is_cancelled:
-                return "cancelled", name, "Cancelled"
+                return "cancelled", name, "Cancelled", file_url, None, size_bytes
 
             is_large = size_bytes is not None and size_bytes >= LARGE_FILE_MIN_BYTES
             has_large_slot = False
@@ -1019,7 +1098,7 @@ class MyrientDownloader(App):
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
                 if self.skip_existing_files and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-                    return "skipped", name, None
+                    return "skipped", name, None, file_url, local_path, os.path.getsize(local_path)
 
                 cmd = [
                     self.rclone_path,
@@ -1047,12 +1126,13 @@ class MyrientDownloader(App):
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
                 if result.returncode == 0:
-                    return "done", name, None
+                    final_size = os.path.getsize(local_path) if os.path.exists(local_path) else size_bytes
+                    return "done", name, None, file_url, local_path, final_size
 
                 error_line = (result.stderr or result.stdout or f"Exit Code {result.returncode}").strip()
                 if error_line:
                     error_line = error_line.splitlines()[-1][:180]
-                return "failed", name, error_line
+                return "failed", name, error_line, file_url, local_path, size_bytes
             finally:
                 if has_large_slot:
                     large_file_semaphore.release()
@@ -1064,12 +1144,16 @@ class MyrientDownloader(App):
             for future in as_completed(futures):
                 if worker.is_cancelled:
                     break
-                status, name, error = future.result()
+                status, name, error, file_url, local_path, file_size = future.result()
                 if status == "failed":
                     fail_count += 1
                     self._show_error_safe(f"Turbo failed: {name}: {error}")
                 elif status == "done":
                     done_count += 1
+                    self._record_download_manifest(file_url, local_path, size_bytes=file_size, status="done")
+                elif status == "skipped":
+                    done_count += 1
+                    self._record_download_manifest(file_url, local_path, size_bytes=file_size, status="skipped")
 
                 progress_done = done_count + fail_count
                 self._update_status_label(f"Turbo [{progress_done}/{total}] {done_count} done, {fail_count} failed")
@@ -1599,12 +1683,16 @@ class MyrientDownloader(App):
 
             def _handle_result(file_info, result):
                 status, name, error, size = result
+                _file_name, file_url, _file_size = file_info
+                local_path = self._url_to_local_path(file_url)
                 if status == "skipped":
                     with self.download_lock:
                         self.files_skipped += 1
+                    self._record_download_manifest(file_url, local_path, size_bytes=size, status="skipped")
                 elif status:
                     with self.download_lock:
                         self.files_completed += 1
+                    self._record_download_manifest(file_url, local_path, size_bytes=size, status="done")
                 else:
                     with self.download_lock:
                         self.files_failed += 1
