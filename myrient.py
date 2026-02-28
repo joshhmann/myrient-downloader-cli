@@ -1188,31 +1188,78 @@ class MyrientDownloader(App):
             remote = self.rclone_remote.strip()
             if not remote.endswith(":"):
                 remote += ":"
-
-            if remote == ":http:":
-                done_count, fail_count = self._run_rclone_copyurl_turbo(url, worker)
-                if done_count > 0:
-                    self.app.call_from_thread(
-                        self.notify,
-                        f"Turbo Download Complete! {done_count} files transferred ({fail_count} failed).",
-                    )
-                elif fail_count > 0:
-                    self.app.call_from_thread(
-                        self.notify,
-                        f"Turbo ended with 0 completed files ({fail_count} failed).",
-                        severity="warning",
-                    )
-                else:
-                    self.app.call_from_thread(
-                        self.notify,
-                        "Turbo found no files to transfer.",
-                        severity="warning",
-                    )
-                return
             
             # rclone expects decoded paths, not URL-encoded ones
             clean_rel_path = rel_path_unquoted.lstrip("/")
             source = f"{remote}{clean_rel_path}"
+            http_url_for_copy = BASE_URL
+
+            if remote == ":http:":
+                root_url = BASE_URL.split("/files/")[0] + "/"
+                source_candidates = [
+                    (f"{remote}{clean_rel_path}", BASE_URL),
+                    (
+                        f"{remote}{'files/' + clean_rel_path if clean_rel_path else 'files/'}",
+                        root_url,
+                    ),
+                ]
+                if clean_rel_path and not clean_rel_path.endswith("/"):
+                    source_candidates.extend(
+                        [
+                            (f"{remote}{clean_rel_path}/", BASE_URL),
+                            (f"{remote}files/{clean_rel_path}/", root_url),
+                        ]
+                    )
+
+                selected = None
+                for candidate_source, candidate_http_url in source_candidates:
+                    probe_cmd = [
+                        self.rclone_path,
+                        "lsf",
+                        candidate_source,
+                        "--max-depth",
+                        "1",
+                        "--timeout",
+                        "20s",
+                        "--http-url",
+                        candidate_http_url,
+                        "--http-no-head",
+                    ]
+                    probe_result = subprocess.run(
+                        probe_cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                    )
+                    if probe_result.returncode == 0 and (probe_result.stdout or "").strip():
+                        selected = (candidate_source, candidate_http_url)
+                        break
+
+                if selected is not None:
+                    source, http_url_for_copy = selected
+                else:
+                    self._update_status_label("Turbo: native :http: probe failed, using copyurl fallback...")
+                    done_count, fail_count = self._run_rclone_copyurl_turbo(url, worker)
+                    if done_count > 0:
+                        self.app.call_from_thread(
+                            self.notify,
+                            f"Turbo Download Complete! {done_count} files transferred ({fail_count} failed).",
+                        )
+                    elif fail_count > 0:
+                        self.app.call_from_thread(
+                            self.notify,
+                            f"Turbo ended with 0 completed files ({fail_count} failed).",
+                            severity="warning",
+                        )
+                    else:
+                        self.app.call_from_thread(
+                            self.notify,
+                            "Turbo found no files to transfer.",
+                            severity="warning",
+                        )
+                    return
             
             # 3. Construct Destination (Windows/Linux safe)
             dest = self.destination_folder
@@ -1239,6 +1286,9 @@ class MyrientDownloader(App):
                 "--buffer-size", "32M",
                 "-v",
             ]
+
+            if remote == ":http:":
+                cmd.extend(["--http-url", http_url_for_copy, "--http-no-head"])
 
             self._update_status_label("Turbo: Starting rclone...")
 
@@ -1293,12 +1343,33 @@ class MyrientDownloader(App):
                         severity="warning",
                     )
                 elif files_done == 0:
-                    self.app.call_from_thread(
-                        self.notify,
-                        "Turbo transferred 0 files; falling back to Python downloader.",
-                        severity="warning",
-                    )
-                    fallback_to_python = True
+                    if remote == ":http:":
+                        self._update_status_label("Turbo native :http: transferred 0; trying copyurl fallback...")
+                        done_count, fail_count = self._run_rclone_copyurl_turbo(url, worker)
+                        if done_count > 0:
+                            self.app.call_from_thread(
+                                self.notify,
+                                f"Turbo Download Complete! {done_count} files transferred ({fail_count} failed).",
+                            )
+                        elif fail_count > 0:
+                            self.app.call_from_thread(
+                                self.notify,
+                                f"Turbo ended with 0 completed files ({fail_count} failed).",
+                                severity="warning",
+                            )
+                        else:
+                            self.app.call_from_thread(
+                                self.notify,
+                                "Turbo found no files to transfer.",
+                                severity="warning",
+                            )
+                    else:
+                        self.app.call_from_thread(
+                            self.notify,
+                            "Turbo transferred 0 files; falling back to Python downloader.",
+                            severity="warning",
+                        )
+                        fallback_to_python = True
                 else:
                     self.app.call_from_thread(
                         self.notify, f"Turbo Download Complete! {files_done} files transferred."
@@ -1306,8 +1377,27 @@ class MyrientDownloader(App):
             else:
                 error_msg = last_lines[-1] if last_lines else f"Exit Code {process.returncode}"
                 if "directory not found" in error_msg.lower():
-                    error_msg = "Source path not found on server. Try refreshing directory."
-                self.show_error(f"Rclone Failed: {error_msg}")
+                    error_msg = "Source path not found on server."
+                if remote == ":http:":
+                    self._update_status_label(f"Turbo native :http: failed ({error_msg[:80]}), trying copyurl fallback...")
+                    done_count, fail_count = self._run_rclone_copyurl_turbo(url, worker)
+                    if done_count > 0:
+                        self.app.call_from_thread(
+                            self.notify,
+                            f"Turbo Download Complete! {done_count} files transferred ({fail_count} failed).",
+                        )
+                    elif fail_count > 0:
+                        self.app.call_from_thread(
+                            self.notify,
+                            f"Turbo failed and fallback also had {fail_count} failures.",
+                            severity="error",
+                        )
+                    else:
+                        self.show_error(f"Rclone Failed: {error_msg} (fallback found no files)")
+                else:
+                    if "source path not found" in error_msg.lower():
+                        error_msg = "Source path not found on server. Try refreshing directory."
+                    self.show_error(f"Rclone Failed: {error_msg}")
         except Exception as e:
             self.show_error(f"Turbo Mode Error: {e}")
         finally:
