@@ -4,3 +4,4 @@ dist
 build
 *.egg-info
 settings.json
+rclone-v1.73.1-windows-amd64/

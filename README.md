@@ -13,7 +13,9 @@ Browse the Myrient file repository directly from your terminal and download file
 - **Recursive Download**: Download entire folders and their subfolders with a single keypress.
 - **File Search**: Search for files and folders by name across the current directory or the entire site.
 - **Extension Filter**: Only download specific file types (e.g., `zip,7z,iso`).
-- **Settings Persistence**: Saves all preferences (destination, turbo mode, rclone path) to `settings.json`.
+- **Request Throttling**: Global request-rate limits for Python and Turbo mode to avoid hammering Myrient.
+- **Live Rate Indicator**: Status bar shows current HTTP request pace vs configured caps.
+- **Settings Persistence**: Saves all preferences (destination, turbo mode, rclone path, rate limits) to `settings.json`.
 
 ## Installation
 
@@ -57,8 +59,8 @@ Turbo Mode uses `rclone`'s high-concurrency engine to bypass Python's speed limi
 | `Enter` | Open folder / Download file |
 | `Type...` | Type-ahead search (jumps to match in current view) |
 | `/` | **Search** files and folders (substring or glob pattern) |
-| `Ctrl+D` | **Download** current folder recursively |
-| `?` | **Settings** (destination, concurrent downloads, filters) |
+| `Ctrl+D` | Download folder or export links (based on mode) |
+| `?` | **Settings** (destination, concurrency, rate limits, filters) |
 | `Backspace` | Go to parent folder |
 | `Esc` | Clear search / Stop download (double press) |
 | `Ctrl+Q` | Quit |
@@ -70,9 +72,16 @@ Press `?` to configure:
 | Setting | Description |
 | :--- | :--- |
 | **Destination Folder** | Where downloads are saved |
-| **Concurrent Downloads** | Number of simultaneous downloads (1, 3, 5, 10, 20) |
+| **Operation Mode** | `Download Files` or `Export Links` (writes URLs to `myrient-links-*.txt`) |
+| **Concurrent Downloads** | Number of simultaneous Python downloads (small files can run high here) |
+| **Max Requests/sec (Python)** | Global cap for all HTTP requests made by the Python downloader and scanner |
+| **Max Requests/sec (rclone)** | `rclone --tpslimit` cap used in Turbo mode |
+| **Large Files Parallel (>=1GB)** | Caps how many 1GB+ files can download at once (1-5) |
 | **File Extensions** | Only download these types (e.g., `zip,7z,iso`). Leave blank for all. |
 | **Skip Existing Files** | Skip fully downloaded files, resume partial ones |
+
+Tip: start conservative (`1.0` req/sec for both caps) and only raise slowly if needed.
+Large files (>= `1 GB`) are capped separately, so you can keep small-file concurrency high without blasting big transfers in parallel.
 
 Settings are saved to `settings.json` in the app directory.
 

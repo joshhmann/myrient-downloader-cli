@@ -2,10 +2,12 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import unquote, urljoin
 
@@ -35,14 +37,31 @@ from textual.worker import get_current_worker
 from urllib3.util.retry import Retry
 
 BASE_URL = "https://myrient.erista.me/files/"
-SETTINGS_FILE = "settings.json"
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 VERSION = "0.6.0"
+DEFAULT_MAX_REQUESTS_PER_SECOND = 1.0
+DEFAULT_RCLONE_TPS_LIMIT = 1.0
+LARGE_FILE_MIN_BYTES = 1024 * 1024 * 1024
+DEFAULT_LARGE_FILE_PARALLEL_LIMIT = 3
 
 
 class SettingsScreen(ModalScreen):
     BINDINGS = [("escape", "close_settings", "Close")]
 
-    def __init__(self, current_dest, current_concurrent=8, current_extensions="", current_skip_existing=False, current_rclone_path="rclone", current_use_turbo=False, current_rclone_remote=":http:"):
+    def __init__(
+        self,
+        current_dest,
+        current_concurrent=16,
+        current_extensions="",
+        current_skip_existing=False,
+        current_rclone_path="rclone",
+        current_use_turbo=False,
+        current_rclone_remote=":http:",
+        current_max_requests_per_second=DEFAULT_MAX_REQUESTS_PER_SECOND,
+        current_rclone_tps_limit=DEFAULT_RCLONE_TPS_LIMIT,
+        current_large_file_parallel_limit=DEFAULT_LARGE_FILE_PARALLEL_LIMIT,
+        current_operation_mode="download",
+    ):
         super().__init__()
         self.current_dest = current_dest
         self.current_concurrent = current_concurrent
@@ -51,6 +70,10 @@ class SettingsScreen(ModalScreen):
         self.current_rclone_path = current_rclone_path
         self.current_use_turbo = current_use_turbo
         self.current_rclone_remote = current_rclone_remote
+        self.current_max_requests_per_second = current_max_requests_per_second
+        self.current_rclone_tps_limit = current_rclone_tps_limit
+        self.current_large_file_parallel_limit = current_large_file_parallel_limit
+        self.current_operation_mode = current_operation_mode
 
     def compose(self) -> ComposeResult:
         with Container(id="settings-dialog"):
@@ -63,7 +86,7 @@ class SettingsScreen(ModalScreen):
                     yield Label("Concurrent (Python):")
                     yield Select(
                         [("1", 1), ("5", 5), ("8", 8), ("16", 16), ("20", 20), ("32", 32)],
-                        value=self.current_concurrent if self.current_concurrent in [1, 5, 8, 16, 20, 32] else 8,
+                        value=self.current_concurrent if self.current_concurrent in [1, 5, 8, 16, 20, 32] else 16,
                         id="concurrent-select"
                     )
                 with Vertical():
@@ -73,6 +96,15 @@ class SettingsScreen(ModalScreen):
                         value=self.current_use_turbo,
                         id="turbo-select"
                     )
+                with Vertical():
+                    yield Label("Operation Mode:")
+                    yield Select(
+                        [("Download Files", "download"), ("Export Links", "links")],
+                        value=self.current_operation_mode
+                        if self.current_operation_mode in ["download", "links"]
+                        else "download",
+                        id="operation-mode-select",
+                    )
 
             with Horizontal():
                 with Vertical():
@@ -81,6 +113,23 @@ class SettingsScreen(ModalScreen):
                 with Vertical():
                     yield Label("Rclone Remote:")
                     yield Input(value=str(self.current_rclone_remote), id="rclone-remote-input", placeholder=":http: or myrient:")
+
+            with Horizontal():
+                with Vertical():
+                    yield Label("Max Requests/sec (Python):")
+                    yield Input(value=str(self.current_max_requests_per_second), id="requests-rate-input")
+                with Vertical():
+                    yield Label("Max Requests/sec (rclone):")
+                    yield Input(value=str(self.current_rclone_tps_limit), id="rclone-tps-input")
+                with Vertical():
+                    yield Label("Large Files Parallel (>=1GB):")
+                    yield Select(
+                        [("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5)],
+                        value=self.current_large_file_parallel_limit
+                        if self.current_large_file_parallel_limit in [1, 2, 3, 4, 5]
+                        else DEFAULT_LARGE_FILE_PARALLEL_LIMIT,
+                        id="large-files-select",
+                    )
 
             yield Label("File Extensions (e.g., zip,7z):")
             yield Input(value=self.current_extensions, id="extensions-input")
@@ -104,7 +153,25 @@ class SettingsScreen(ModalScreen):
             new_rclone_path = self.query_one("#rclone-path-input", Input).value
             new_use_turbo = self.query_one("#turbo-select", Select).value
             new_rclone_remote = self.query_one("#rclone-remote-input", Input).value
-            self.dismiss((new_dest, new_concurrent, new_extensions, new_skip_existing, new_rclone_path, new_use_turbo, new_rclone_remote))
+            new_requests_rate = self.query_one("#requests-rate-input", Input).value
+            new_rclone_tps = self.query_one("#rclone-tps-input", Input).value
+            new_large_files_parallel = self.query_one("#large-files-select", Select).value
+            new_operation_mode = self.query_one("#operation-mode-select", Select).value
+            self.dismiss(
+                (
+                    new_dest,
+                    new_concurrent,
+                    new_extensions,
+                    new_skip_existing,
+                    new_rclone_path,
+                    new_use_turbo,
+                    new_rclone_remote,
+                    new_requests_rate,
+                    new_rclone_tps,
+                    new_large_files_parallel,
+                    new_operation_mode,
+                )
+            )
         else:
             self.dismiss(None)
 
@@ -203,6 +270,9 @@ class MyrientDownloader(App):
         margin-top: 1;
         align: center middle;
     }
+    #rate-text {
+        color: $text-muted;
+    }
     """
 
     BINDINGS = [
@@ -216,12 +286,16 @@ class MyrientDownloader(App):
 
     current_url = reactive(BASE_URL)
     destination_folder = reactive(os.getcwd())
-    concurrent_downloads = reactive(8)
+    concurrent_downloads = reactive(16)
     file_extensions = reactive("")
     skip_existing_files = reactive(False)
     rclone_path = reactive("rclone")
     rclone_remote = reactive(":http:")
     use_turbo = reactive(False)
+    operation_mode = reactive("download")
+    max_requests_per_second = reactive(DEFAULT_MAX_REQUESTS_PER_SECOND)
+    rclone_tps_limit = reactive(DEFAULT_RCLONE_TPS_LIMIT)
+    large_file_parallel_limit = reactive(DEFAULT_LARGE_FILE_PARALLEL_LIMIT)
     download_queue = []
     is_downloading = reactive(False)
     is_loading_dir = reactive(False)
@@ -237,6 +311,11 @@ class MyrientDownloader(App):
     row_data = {}
     # Thread-local storage for sessions (each thread gets its own session)
     _thread_local = threading.local()
+    large_file_semaphore = None
+    request_rate_lock = threading.Lock()
+    next_request_allowed_at = 0.0
+    request_timestamps = deque()
+    last_rate_ui_update = 0.0
 
     search_query = ""
     last_search_time = 0
@@ -256,13 +335,14 @@ class MyrientDownloader(App):
                 progress_bar.display = False
                 progress_bar.total = 100
                 status_text.update("Ready")
+                self._update_rate_indicator()
             else:
                 # Restore download status if needed
                 pass
 
     def show_error(self, message):
         self.notify(message, severity="error")
-        print(f"ERROR: {message}", file=sys.stderr)
+        self.log.error(message)
 
     def _update_status_label(self, message):
         """Update status label from any thread."""
@@ -277,17 +357,30 @@ class MyrientDownloader(App):
         """Show error from any thread."""
         self.app.call_from_thread(lambda: self.show_error(message))
 
+    def _set_progress_values(self, done, total):
+        try:
+            bar = self.query_one("#progress", ProgressBar)
+            if total > 0:
+                bar.total = total
+                bar.progress = done
+            else:
+                bar.total = None
+        except Exception:
+            pass
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Label(f"Current: {self.current_url}", id="url-label")
         yield DataTable(id="file-list", cursor_type="row")
         with Container(id="status-bar"):
             yield Label("Ready", id="status-text")
+            yield Label("", id="rate-text")
             yield ProgressBar(total=100, show_eta=True, id="progress")
         yield Footer()
 
     def on_mount(self):
         self.load_settings()
+        self._update_rate_indicator()
         table = self.query_one("#file-list", DataTable)
         table.add_columns("Name", "Size")
         self.load_directory_worker(self.current_url)
@@ -313,12 +406,36 @@ class MyrientDownloader(App):
                         dest = dest[0] if len(dest) > 0 else os.getcwd()
                     self.destination_folder = dest
                     self.current_url = settings.get("last_url", BASE_URL)
-                    self.concurrent_downloads = settings.get("concurrent_downloads", 8)
+                    self.concurrent_downloads = self._parse_int_setting(
+                        settings.get("concurrent_downloads", 16),
+                        16,
+                        minimum=1,
+                        maximum=32,
+                    )
                     self.file_extensions = settings.get("file_extensions", "")
                     self.skip_existing_files = settings.get("skip_existing_files", False)
                     self.rclone_path = settings.get("rclone_path", default_rclone)
                     self.rclone_remote = settings.get("rclone_remote", ":http:")
                     self.use_turbo = settings.get("use_turbo", False)
+                    self.operation_mode = (
+                        settings.get("operation_mode", "download")
+                        if settings.get("operation_mode", "download") in ["download", "links"]
+                        else "download"
+                    )
+                    self.max_requests_per_second = self._parse_float_setting(
+                        settings.get("max_requests_per_second", DEFAULT_MAX_REQUESTS_PER_SECOND),
+                        DEFAULT_MAX_REQUESTS_PER_SECOND,
+                    )
+                    self.rclone_tps_limit = self._parse_float_setting(
+                        settings.get("rclone_tps_limit", DEFAULT_RCLONE_TPS_LIMIT),
+                        DEFAULT_RCLONE_TPS_LIMIT,
+                    )
+                    self.large_file_parallel_limit = self._parse_int_setting(
+                        settings.get("large_file_parallel_limit", DEFAULT_LARGE_FILE_PARALLEL_LIMIT),
+                        DEFAULT_LARGE_FILE_PARALLEL_LIMIT,
+                        minimum=1,
+                        maximum=5,
+                    )
             else:
                 self.rclone_path = default_rclone
         except Exception as e:
@@ -335,11 +452,92 @@ class MyrientDownloader(App):
                 "rclone_path": self.rclone_path,
                 "rclone_remote": self.rclone_remote,
                 "use_turbo": self.use_turbo,
+                "operation_mode": self.operation_mode,
+                "max_requests_per_second": self.max_requests_per_second,
+                "rclone_tps_limit": self.rclone_tps_limit,
+                "large_file_parallel_limit": self.large_file_parallel_limit,
             }
             with open(SETTINGS_FILE, "w") as f:
                 json.dump(settings, f, indent=4)
         except Exception as e:
             self.show_error(f"Error saving settings: {e}")
+
+    def _parse_int_setting(self, value, default, minimum=1, maximum=32):
+        try:
+            parsed = int(value)
+            if parsed < minimum:
+                return minimum
+            if parsed > maximum:
+                return maximum
+            return parsed
+        except (TypeError, ValueError):
+            return default
+
+    def _parse_float_setting(self, value, default, minimum=0.1, maximum=100.0):
+        try:
+            parsed = float(value)
+            if parsed < minimum:
+                return minimum
+            if parsed > maximum:
+                return maximum
+            return parsed
+        except (TypeError, ValueError):
+            return default
+
+    def _update_rate_indicator(self, observed_rps=None, active=False):
+        base = (
+            f"HTTP cap {self.max_requests_per_second:.1f}/s | "
+            f"rclone cap {self.rclone_tps_limit:.1f}/s | "
+            f"large>=1GB x{self.large_file_parallel_limit}"
+        )
+        if active and observed_rps is not None:
+            base = (
+                f"HTTP now ~{observed_rps:.1f}/s (cap {self.max_requests_per_second:.1f}/s) | "
+                f"rclone cap {self.rclone_tps_limit:.1f}/s | "
+                f"large>=1GB x{self.large_file_parallel_limit}"
+            )
+
+        def _update():
+            try:
+                self.query_one("#rate-text", Label).update(base)
+            except Exception:
+                pass
+
+        try:
+            self.app.call_from_thread(_update)
+        except Exception:
+            _update()
+
+    def _wait_for_request_slot(self):
+        min_interval = 1.0 / max(0.1, float(self.max_requests_per_second))
+        with self.request_rate_lock:
+            now = time.monotonic()
+            while self.request_timestamps and now - self.request_timestamps[0] > 1.0:
+                self.request_timestamps.popleft()
+            self.request_timestamps.append(now)
+            observed_rps = float(len(self.request_timestamps))
+
+            wait_for = self.next_request_allowed_at - now
+            if wait_for > 0:
+                time.sleep(wait_for)
+                now = time.monotonic()
+            self.next_request_allowed_at = max(now, self.next_request_allowed_at) + min_interval
+
+            if now - self.last_rate_ui_update >= 0.3:
+                self.last_rate_ui_update = now
+                self._update_rate_indicator(observed_rps=observed_rps, active=True)
+
+    def _requests_get(self, url, **kwargs):
+        self._wait_for_request_slot()
+        return requests.get(url, **kwargs)
+
+    def _session_get(self, session, url, **kwargs):
+        self._wait_for_request_slot()
+        return session.get(url, **kwargs)
+
+    def _session_head(self, session, url, **kwargs):
+        self._wait_for_request_slot()
+        return session.head(url, **kwargs)
 
     def on_unmount(self):
         self.save_settings()
@@ -424,11 +622,32 @@ class MyrientDownloader(App):
 
         return items
 
+    def _parse_size_to_bytes(self, size_text):
+        if not size_text:
+            return None
+        normalized = str(size_text).strip().upper().replace("IB", "B")
+        if normalized in {"-", "", "DIR"}:
+            return None
+        try:
+            if normalized.endswith("KB"):
+                return int(float(normalized[:-2].strip()) * 1024)
+            if normalized.endswith("MB"):
+                return int(float(normalized[:-2].strip()) * 1024 * 1024)
+            if normalized.endswith("GB"):
+                return int(float(normalized[:-2].strip()) * 1024 * 1024 * 1024)
+            if normalized.endswith("TB"):
+                return int(float(normalized[:-2].strip()) * 1024 * 1024 * 1024 * 1024)
+            if normalized.endswith("B"):
+                return int(float(normalized[:-1].strip()))
+            return int(float(normalized.replace(",", "")))
+        except ValueError:
+            return None
+
     @work(thread=True)
     def load_directory_worker(self, url):
         self.app.call_from_thread(setattr, self, "is_loading_dir", True)
         try:
-            response = requests.get(url, timeout=30)
+            response = self._requests_get(url, timeout=30)
             response.raise_for_status()
 
             items = self.parse_directory_html(response.text, url)
@@ -451,7 +670,12 @@ class MyrientDownloader(App):
                     display_name.append(text_content)
 
                     row_key = table.add_row(display_name, size)
-                    self.row_data[row_key] = (text_content, is_dir, full_url)
+                    self.row_data[row_key] = (
+                        text_content,
+                        is_dir,
+                        full_url,
+                        self._parse_size_to_bytes(size),
+                    )
 
                 table.focus()
 
@@ -465,7 +689,7 @@ class MyrientDownloader(App):
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         row_key = event.row_key
         if row_key in self.row_data:
-            name, is_dir, href = self.row_data[row_key]
+            name, is_dir, href, size_bytes = self.row_data[row_key]
             if is_dir:
                 self.current_url = href
                 self.load_directory_worker(self.current_url)
@@ -475,8 +699,12 @@ class MyrientDownloader(App):
                         "Download in progress. Please wait.", severity="warning"
                     )
                 else:
-                    self.download_queue = [(name, is_dir, href)]
-                    self.start_download_worker()
+                    if self.operation_mode == "links":
+                        self.download_queue = [(name, is_dir, href, size_bytes)]
+                        self.start_link_export_worker()
+                    else:
+                        self.download_queue = [(name, is_dir, href, size_bytes)]
+                        self.start_download_worker()
 
     def action_go_up(self):
         if self.current_url == BASE_URL:
@@ -549,7 +777,7 @@ class MyrientDownloader(App):
         table = self.query_one("#file-list", DataTable)
 
         # Iterate through row_data to find match
-        for row_key, (name, is_dir, href) in self.row_data.items():
+        for row_key, (name, is_dir, href, _size_bytes) in self.row_data.items():
             if name.lower().startswith(query):
                 # Found match
                 index = table.get_row_index(row_key)
@@ -560,18 +788,68 @@ class MyrientDownloader(App):
     def action_open_settings(self):
         def set_settings(result):
             if result:
-                new_dest, new_concurrent, new_extensions, new_skip_existing, new_rclone, new_turbo, new_remote = result
+                (
+                    new_dest,
+                    new_concurrent,
+                    new_extensions,
+                    new_skip_existing,
+                    new_rclone,
+                    new_turbo,
+                    new_remote,
+                    new_requests_rate,
+                    new_rclone_tps,
+                    new_large_files_parallel,
+                    new_operation_mode,
+                ) = result
                 self.destination_folder = new_dest
-                self.concurrent_downloads = new_concurrent
+                self.concurrent_downloads = self._parse_int_setting(
+                    new_concurrent,
+                    self.concurrent_downloads,
+                    minimum=1,
+                    maximum=32,
+                )
                 self.file_extensions = new_extensions
                 self.skip_existing_files = new_skip_existing
                 self.rclone_path = new_rclone
                 self.use_turbo = new_turbo
                 self.rclone_remote = new_remote
+                self.operation_mode = (
+                    new_operation_mode if new_operation_mode in ["download", "links"] else "download"
+                )
+                self.max_requests_per_second = self._parse_float_setting(
+                    new_requests_rate,
+                    self.max_requests_per_second,
+                )
+                self.rclone_tps_limit = self._parse_float_setting(
+                    new_rclone_tps,
+                    self.rclone_tps_limit,
+                )
+                self.large_file_parallel_limit = self._parse_int_setting(
+                    new_large_files_parallel,
+                    self.large_file_parallel_limit,
+                    minimum=1,
+                    maximum=5,
+                )
                 self.save_settings()
+                self._update_rate_indicator()
                 self.notify(f"Settings saved. Destination: {self.destination_folder}")
 
-        self.push_screen(SettingsScreen(self.destination_folder, self.concurrent_downloads, self.file_extensions, self.skip_existing_files, self.rclone_path, self.use_turbo, self.rclone_remote), set_settings)
+        self.push_screen(
+            SettingsScreen(
+                self.destination_folder,
+                self.concurrent_downloads,
+                self.file_extensions,
+                self.skip_existing_files,
+                self.rclone_path,
+                self.use_turbo,
+                self.rclone_remote,
+                self.max_requests_per_second,
+                self.rclone_tps_limit,
+                self.large_file_parallel_limit,
+                self.operation_mode,
+            ),
+            set_settings,
+        )
 
     def action_open_search(self):
         """Open search to find files recursively."""
@@ -598,7 +876,7 @@ class MyrientDownloader(App):
         def search_directory(url, pat, recursive=False):
             results = []
             try:
-                response = requests.get(url, timeout=30)
+                response = self._requests_get(url, timeout=30)
                 response.raise_for_status()
                 items = self.parse_directory_html(response.text, url)
 
@@ -635,17 +913,24 @@ class MyrientDownloader(App):
             self.notify("Already downloading!", severity="warning")
             return
 
+        if self.operation_mode == "links":
+            items_to_process = self._collect_current_items()
+
+            if not items_to_process:
+                self.notify("Nothing to export in this folder.", severity="warning")
+                return
+
+            self.download_queue = items_to_process
+            self.start_link_export_worker()
+            return
+
         # Turbo Mode (rclone)
         if self.use_turbo:
             self._run_rclone_folder(self.current_url)
             return
 
         # Collect all items in current view (files AND dirs)
-        items_to_process = []
-        # We can use self.row_data
-        for key, value in self.row_data.items():
-            name, is_dir, href = value
-            items_to_process.append((name, is_dir, href))
+        items_to_process = self._collect_current_items()
 
         if not items_to_process:
             self.notify("Nothing to download in this folder.", severity="warning")
@@ -654,12 +939,161 @@ class MyrientDownloader(App):
         self.download_queue = items_to_process
         self.start_download_worker()
 
+    def _collect_current_items(self):
+        items_to_process = []
+        for _key, value in self.row_data.items():
+            name, is_dir, href, size_bytes = value
+            items_to_process.append((name, is_dir, href, size_bytes))
+        return items_to_process
+
+    def _fallback_to_python_download(self):
+        items_to_process = self._collect_current_items()
+        if not items_to_process:
+            self.notify("Turbo fallback skipped: no items in current view.", severity="warning")
+            return
+        self.download_queue = items_to_process
+        self.start_download_worker()
+
+    def _collect_turbo_files(self, start_url, worker):
+        files = []
+        visited_dirs = set()
+        pending_dirs = [start_url]
+
+        while pending_dirs:
+            if worker.is_cancelled:
+                break
+            dir_url = pending_dirs.pop()
+            if dir_url in visited_dirs:
+                continue
+            visited_dirs.add(dir_url)
+
+            scan_path = unquote(dir_url[len(BASE_URL):]) if dir_url.startswith(BASE_URL) else dir_url
+            self._update_status_label(f"Turbo scan: {scan_path or '/'}")
+
+            try:
+                response = self._requests_get(dir_url, timeout=30)
+                response.raise_for_status()
+                items = self.parse_directory_html(response.text, dir_url)
+            except Exception as e:
+                self._show_error_safe(f"Turbo scan error: {e}")
+                continue
+
+            for name, is_dir, item_url, size_text in items:
+                if is_dir:
+                    pending_dirs.append(item_url)
+                elif self.should_download_file(name):
+                    files.append((name, item_url, self._parse_size_to_bytes(size_text)))
+
+        return files
+
+    def _run_rclone_copyurl_turbo(self, start_url, worker):
+        files = self._collect_turbo_files(start_url, worker)
+        if not files:
+            self.app.call_from_thread(
+                self.notify,
+                "Turbo found no files to download (after filters).",
+                severity="warning",
+            )
+            return 0, 0
+
+        large_file_semaphore = threading.Semaphore(max(1, self.large_file_parallel_limit))
+        max_workers = max(1, self.concurrent_downloads)
+        done_count = 0
+        fail_count = 0
+
+        def run_copyurl(file_info):
+            name, file_url, size_bytes = file_info
+            if worker.is_cancelled:
+                return "cancelled", name, "Cancelled"
+
+            is_large = size_bytes is not None and size_bytes >= LARGE_FILE_MIN_BYTES
+            has_large_slot = False
+
+            try:
+                if is_large:
+                    large_file_semaphore.acquire()
+                    has_large_slot = True
+
+                rel_path = unquote(file_url[len(BASE_URL):]) if file_url.startswith(BASE_URL) else name
+                local_path = os.path.join(self.destination_folder, rel_path.replace("/", os.sep))
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+                if self.skip_existing_files and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                    return "skipped", name, None
+
+                cmd = [
+                    self.rclone_path,
+                    "copyurl",
+                    file_url,
+                    local_path,
+                    "--user-agent",
+                    "Mozilla/5.0",
+                    "--tpslimit",
+                    str(self.rclone_tps_limit),
+                    "--tpslimit-burst",
+                    "1",
+                    "--retries",
+                    "3",
+                    "--low-level-retries",
+                    "5",
+                ]
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                if result.returncode == 0:
+                    return "done", name, None
+
+                error_line = (result.stderr or result.stdout or f"Exit Code {result.returncode}").strip()
+                if error_line:
+                    error_line = error_line.splitlines()[-1][:180]
+                return "failed", name, error_line
+            finally:
+                if has_large_slot:
+                    large_file_semaphore.release()
+
+        total = len(files)
+        self.app.call_from_thread(lambda: self._set_progress_values(0, total))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run_copyurl, file_info) for file_info in files]
+            for future in as_completed(futures):
+                if worker.is_cancelled:
+                    break
+                status, name, error = future.result()
+                if status == "failed":
+                    fail_count += 1
+                    self._show_error_safe(f"Turbo failed: {name}: {error}")
+                elif status == "done":
+                    done_count += 1
+
+                progress_done = done_count + fail_count
+                self._update_status_label(f"Turbo [{progress_done}/{total}] {done_count} done, {fail_count} failed")
+                self.app.call_from_thread(lambda d=progress_done, t=total: self._set_progress_values(d, t))
+
+        return done_count, fail_count
+
     @work(thread=True, exclusive=True)
     def _run_rclone_folder(self, url):
         """Execute rclone turbo download."""
+        # Check rclone is available before doing anything
+        rclone_bin = self.rclone_path
+        if not os.path.isfile(rclone_bin) and not shutil.which(rclone_bin):
+            self.app.call_from_thread(
+                self.show_error,
+                f"rclone not found at '{rclone_bin}'. Install it or set the correct path in Settings."
+            )
+            return
+
         self.is_downloading = True
-        self.query_one("#status-bar").add_class("downloading")
+        self.app.call_from_thread(lambda: self.query_one("#status-bar").add_class("downloading"))
         self._update_status_label("Turbo Mode: Initializing rclone...")
+        worker = get_current_worker()
+        fallback_to_python = False
 
         try:
             # 1. Calculate relative path from BASE_URL
@@ -670,11 +1104,31 @@ class MyrientDownloader(App):
             remote = self.rclone_remote.strip()
             if not remote.endswith(":"):
                 remote += ":"
+
+            if remote == ":http:":
+                done_count, fail_count = self._run_rclone_copyurl_turbo(url, worker)
+                if done_count > 0:
+                    self.app.call_from_thread(
+                        self.notify,
+                        f"Turbo Download Complete! {done_count} files transferred ({fail_count} failed).",
+                    )
+                elif fail_count > 0:
+                    self.app.call_from_thread(
+                        self.notify,
+                        f"Turbo ended with 0 completed files ({fail_count} failed).",
+                        severity="warning",
+                    )
+                else:
+                    self.app.call_from_thread(
+                        self.notify,
+                        "Turbo found no files to transfer.",
+                        severity="warning",
+                    )
+                return
             
-            # rel_path_raw already includes encoding from urljoin/requests
-            # We need to ensure we don't end up with remote://path
-            clean_rel_path = rel_path_raw.lstrip("/")
-            source = f"{remote}/{clean_rel_path}"
+            # rclone expects decoded paths, not URL-encoded ones
+            clean_rel_path = rel_path_unquoted.lstrip("/")
+            source = f"{remote}{clean_rel_path}"
             
             # 3. Construct Destination (Windows/Linux safe)
             dest = self.destination_folder
@@ -691,61 +1145,94 @@ class MyrientDownloader(App):
                 "copy",
                 source,
                 dest,
+                "--transfers", "4",
+                "--checkers", "4",
+                "--tpslimit", str(self.rclone_tps_limit),
+                "--tpslimit-burst", "1",
+                "--stats", "2s",
                 "--progress",
-                "--http-no-head",
-                "--transfers", "16",
-                "--checkers", "32",
-                "--stats", "1s",
-                "--stats-one-line",
-                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", "Mozilla/5.0",
                 "--buffer-size", "32M",
-                "-v"
+                "-v",
             ]
 
-            if remote == ":http:":
-                cmd.extend(["--http-url", BASE_URL])
-
-            # Debug: show the command in status for a moment
-            cmd_str = " ".join(cmd)
-            self._update_status_label(f"Running: {cmd[0]} {cmd[1]} {cmd[2]}")
-            time.sleep(1.5)
+            self._update_status_label("Turbo: Starting rclone...")
 
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             )
 
             last_lines = []
-            for line in process.stdout:
-                line_str = line.strip()
-                if line_str:
+            files_done = 0
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    if worker.is_cancelled:
+                        process.terminate()
+                        break
+
+                    line_str = raw_line.strip()
+                    if not line_str:
+                        continue
+
                     last_lines.append(line_str)
-                    if len(last_lines) > 5:
+                    if len(last_lines) > 30:
                         last_lines.pop(0)
-                        
-                if "Transferred:" in line or "ETA" in line:
-                    self._update_status_label(f"Turbo: {line_str}")
-            
+
+                    if ": Copied (" in line_str or ": Copied(" in line_str:
+                        files_done += 1
+                        parts = line_str.split(": Copied")
+                        fname = parts[0].rsplit(":", 1)[-1].strip() if parts else ""
+                        short = fname.rsplit("/", 1)[-1] if fname else ""
+                        self._update_status_label(f"Turbo [{files_done}] done: {short}")
+                    elif "Transferred:" in line_str or "Checks:" in line_str:
+                        self._update_status_label(f"Turbo [{files_done} done] {line_str[:120]}")
+                    elif "nothing to transfer" in line_str.lower():
+                        self._update_status_label("Turbo: nothing to transfer (all files already present)")
+                    elif "ERROR" in line_str:
+                        self._update_status_label(f"Turbo [{files_done}] ERR: {line_str[:100]}")
+
             process.wait()
 
             if process.returncode == 0:
-                self.notify("Turbo Download Complete!")
+                nothing_to_transfer = any("nothing to transfer" in line.lower() for line in last_lines)
+                if nothing_to_transfer:
+                    self.app.call_from_thread(
+                        self.notify,
+                        "Turbo complete: nothing to transfer (files may already exist).",
+                        severity="warning",
+                    )
+                elif files_done == 0:
+                    self.app.call_from_thread(
+                        self.notify,
+                        "Turbo transferred 0 files; falling back to Python downloader.",
+                        severity="warning",
+                    )
+                    fallback_to_python = True
+                else:
+                    self.app.call_from_thread(
+                        self.notify, f"Turbo Download Complete! {files_done} files transferred."
+                    )
             else:
-                # Provide better context for common errors
                 error_msg = last_lines[-1] if last_lines else f"Exit Code {process.returncode}"
                 if "directory not found" in error_msg.lower():
                     error_msg = "Source path not found on server. Try refreshing directory."
                 self.show_error(f"Rclone Failed: {error_msg}")
-
         except Exception as e:
             self.show_error(f"Turbo Mode Error: {e}")
         finally:
             self.is_downloading = False
-            self.query_one("#status-bar").remove_class("downloading")
+            self.app.call_from_thread(lambda: self.query_one("#status-bar").remove_class("downloading"))
+            self._update_rate_indicator()
             self._update_status_label("Ready")
+            if fallback_to_python:
+                self.app.call_from_thread(self._fallback_to_python_download)
 
     def get_retry_session(self, retries=5, backoff_factor=0.5):
         session = requests.Session()
@@ -754,7 +1241,9 @@ class MyrientDownloader(App):
             read=retries,
             connect=retries,
             backoff_factor=backoff_factor,
-            status_forcelist=(500, 502, 504),
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "HEAD"]),
+            respect_retry_after_header=True,
         )
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("http://", adapter)
@@ -780,8 +1269,21 @@ class MyrientDownloader(App):
 
     def download_single_file(self, file_info, worker, max_retries=3):
         """Download a single file - used by both sequential and concurrent modes."""
-        name, url = file_info
+        if len(file_info) == 3:
+            name, url, size_bytes = file_info
+        else:
+            name, url = file_info
+            size_bytes = None
         session = self.get_thread_local_session()
+        is_large_file = size_bytes is not None and size_bytes >= LARGE_FILE_MIN_BYTES
+        acquired_large_slot = False
+
+        if is_large_file and self.large_file_semaphore is not None:
+            self._update_status_label(
+                f"Waiting for large-file slot (limit {self.large_file_parallel_limit}): {name}"
+            )
+            self.large_file_semaphore.acquire()
+            acquired_large_slot = True
         
         if not url.startswith(BASE_URL):
             return False, name, "Invalid URL", 0
@@ -802,52 +1304,56 @@ class MyrientDownloader(App):
                 self.retry_counts[retry_key] = 0
         
         downloaded = local_size
-        for attempt in range(max_retries):
-            try:
-                resume_header = {"Range": f"bytes={local_size}-"} if local_size > 0 else {}
-                
-                with session.get(url, stream=True, headers=resume_header, timeout=(10, 30)) as r:
-                    if r.status_code == 416:
-                        # Might be finished, verify with one HEAD as fallback
-                        head_resp = session.head(url, allow_redirects=True, timeout=(10, 15))
-                        total_size = int(head_resp.headers.get("content-length", 0))
-                        if local_size >= total_size:
-                            return True, name, None, total_size
-                        local_size = 0
-                        continue
+        try:
+            for attempt in range(max_retries):
+                try:
+                    resume_header = {"Range": f"bytes={local_size}-"} if local_size > 0 else {}
+                    
+                    with self._session_get(session, url, stream=True, headers=resume_header, timeout=(10, 30)) as r:
+                        if r.status_code == 416:
+                            # Might be finished, verify with one HEAD as fallback
+                            head_resp = self._session_head(session, url, allow_redirects=True, timeout=(10, 15))
+                            total_size = int(head_resp.headers.get("content-length", 0))
+                            if local_size >= total_size:
+                                return True, name, None, total_size
+                            local_size = 0
+                            continue
 
-                    r.raise_for_status()
-                    
-                    if r.status_code == 200:
-                        local_size = 0
-                        mode = "wb"
-                    else:
-                        mode = "ab" if local_size > 0 else "wb"
+                        r.raise_for_status()
                         
-                    total_length = int(r.headers.get("content-length", 0))
-                    if mode == "ab":
-                        total_length += local_size
+                        if r.status_code == 200:
+                            local_size = 0
+                            mode = "wb"
+                        else:
+                            mode = "ab" if local_size > 0 else "wb"
+                            
+                        total_length = int(r.headers.get("content-length", 0))
+                        if mode == "ab":
+                            total_length += local_size
+                        
+                        downloaded = local_size
+                        with open(filepath, mode) as f:
+                            for chunk in r.iter_content(chunk_size=131072):
+                                if worker.is_cancelled:
+                                    return False, name, "Cancelled", downloaded
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
                     
-                    downloaded = local_size
-                    with open(filepath, mode) as f:
-                        for chunk in r.iter_content(chunk_size=131072):
-                            if worker.is_cancelled:
-                                return False, name, "Cancelled", downloaded
-                            if chunk:
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                
-                return True, name, None, total_length
-            except Exception as e:
-                with self.download_lock:
-                    self.retry_counts[retry_key] += 1
-                if attempt == max_retries - 1:
-                    return False, name, str(e), downloaded
-                else:
-                    time.sleep(1)
-                    continue
-        
-        return False, name, "Max retries exceeded", 0
+                    return True, name, None, total_length
+                except Exception as e:
+                    with self.download_lock:
+                        self.retry_counts[retry_key] += 1
+                    if attempt == max_retries - 1:
+                        return False, name, str(e), downloaded
+                    else:
+                        time.sleep(1)
+                        continue
+            
+            return False, name, "Max retries exceeded", 0
+        finally:
+            if acquired_large_slot and self.large_file_semaphore is not None:
+                self.large_file_semaphore.release()
 
     def _scan_directories(self, initial_queue, file_queue, worker, scan_done_event):
         """Scanner: walks directories concurrently and feeds files into file_queue."""
@@ -859,14 +1365,14 @@ class MyrientDownloader(App):
         scan_lock = threading.Lock()
 
         # Separate initial items into dirs and files
-        for name, is_dir, url in initial_queue:
+        for name, is_dir, url, size_bytes in initial_queue:
             if is_dir:
                 dir_queue.put((name, url))
             elif self.should_download_file(name):
                 files_found += 1
                 with self.download_lock:
                     self.total_files_to_download = files_found
-                file_queue.put((name, url))
+                file_queue.put((name, url, size_bytes))
 
         # Thread-local sessions for scanner threads
         scan_local = threading.local()
@@ -895,21 +1401,22 @@ class MyrientDownloader(App):
 
             try:
                 session = get_scan_session()
-                response = session.get(dir_url, timeout=30)
+                response = self._session_get(session, dir_url, timeout=30)
                 response.raise_for_status()
                 items = self.parse_directory_html(response.text, dir_url)
 
-                for item_name, item_is_dir, item_url, _ in items:
+                for item_name, item_is_dir, item_url, item_size in items:
                     if worker.is_cancelled:
                         return
                     if item_is_dir:
                         dir_queue.put((item_name, item_url))
                     elif self.should_download_file(item_name):
+                        item_size_bytes = self._parse_size_to_bytes(item_size)
                         with scan_lock:
                             files_found += 1
                         with self.download_lock:
                             self.total_files_to_download = files_found
-                        file_queue.put((item_name, item_url))
+                        file_queue.put((item_name, item_url, item_size_bytes))
 
             except Exception as e:
                 self._show_error_safe(f"Error scanning {dir_name}: {e}")
@@ -944,6 +1451,86 @@ class MyrientDownloader(App):
 
         scan_done_event.set()
 
+    def _build_links_output_path(self):
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        return os.path.join(self.destination_folder, f"myrient-links-{timestamp}.txt")
+
+    @work(thread=True, exclusive=True)
+    def start_link_export_worker(self):
+        self.is_downloading = True
+        self.query_one("#status-bar").add_class("downloading")
+        progress_bar = self.query_one("#progress", ProgressBar)
+        progress_bar.display = True
+
+        try:
+            import queue as queue_module
+
+            scan_queue = list(self.download_queue)
+            worker = get_current_worker()
+            file_queue = queue_module.Queue()
+            scan_done_event = threading.Event()
+
+            self.total_files_to_download = 0
+            self.files_completed = 0
+            self.files_failed = 0
+            self.files_skipped = 0
+
+            scanner = threading.Thread(
+                target=self._scan_directories,
+                args=(scan_queue, file_queue, worker, scan_done_event),
+                daemon=True,
+            )
+            scanner.start()
+
+            link_results = []
+            seen = set()
+
+            while not (scan_done_event.is_set() and file_queue.empty()):
+                if worker.is_cancelled:
+                    return
+                try:
+                    name, url, _size_bytes = file_queue.get(timeout=0.1)
+                except queue_module.Empty:
+                    continue
+
+                if url not in seen:
+                    seen.add(url)
+                    link_results.append(url)
+
+                self.files_completed += 1
+                done = self.files_completed
+                total = self.total_files_to_download
+                self._update_status_label(f"[{done}/{total}] collected link: {name}")
+                self.app.call_from_thread(
+                    lambda d=done, t=total: self._set_progress_values(d, t)
+                )
+
+            scanner.join(timeout=5)
+
+            if not link_results:
+                self.notify("No links matched current filters.", severity="warning")
+            else:
+                os.makedirs(self.destination_folder, exist_ok=True)
+                output_path = self._build_links_output_path()
+                with open(output_path, "w", encoding="utf-8") as out:
+                    out.write("\n".join(link_results))
+                    out.write("\n")
+                self.notify(f"Exported {len(link_results)} links to {output_path}")
+
+            self.is_downloading = False
+            self.query_one("#status-bar").remove_class("downloading")
+            progress_bar.display = False
+            self.query_one("#status-text", Label).update("Ready")
+            self._update_rate_indicator()
+
+        except Exception as e:
+            self.show_error(f"Link export worker crashed: {e}")
+            self.is_downloading = False
+            self.query_one("#status-bar").remove_class("downloading")
+            progress_bar.display = False
+            self.query_one("#status-text", Label).update("Error")
+            self._update_rate_indicator()
+
     @work(thread=True, exclusive=True)
     def start_download_worker(self):
         self.is_downloading = True
@@ -966,6 +1553,9 @@ class MyrientDownloader(App):
             self.retry_counts = {}
 
             max_workers = max(1, self.concurrent_downloads)
+            self.large_file_semaphore = threading.Semaphore(
+                max(1, self.large_file_parallel_limit)
+            )
 
             # Start scanner thread
             scanner = threading.Thread(
@@ -1097,6 +1687,8 @@ class MyrientDownloader(App):
                 f"Done! {self.files_completed} downloaded, "
                 f"{self.files_failed} failed, {self.files_skipped} skipped"
             )
+            self._update_rate_indicator()
+            self.large_file_semaphore = None
 
         except Exception as e:
             self.show_error(f"Download worker crashed: {e}")
@@ -1104,6 +1696,8 @@ class MyrientDownloader(App):
             self.query_one("#status-bar").remove_class("downloading")
             progress_bar.display = False
             self.query_one("#status-text", Label).update("Error")
+            self._update_rate_indicator()
+            self.large_file_semaphore = None
 
     def stop_download(self):
         """Cancel the download worker."""
