@@ -671,15 +671,17 @@ class MyrientDownloader(App):
             if not remote.endswith(":"):
                 remote += ":"
             
-            # If the remote is :http:, we need to ensure the path doesn't start with /
-            # so rclone combines it correctly with --http-url
-            source_path = rel_path_raw.lstrip("/")
+            # Ensure path starts with / for rclone to resolve correctly from root
+            source_path = rel_path_raw
+            if not source_path.startswith("/"):
+                source_path = "/" + source_path
+                
             source = f"{remote}{source_path}"
             
-            # 3. Construct Destination (Windows-safe)
+            # 3. Construct Destination (Windows/Linux safe)
             dest = self.destination_folder
             if rel_path_unquoted:
-                # Remove trailing slashes and normalize separators for the OS
+                # Remove trailing slashes and normalize separators
                 sub_path = rel_path_unquoted.strip("/").strip("\\").replace("/", os.sep)
                 if sub_path:
                     dest = os.path.join(dest, sub_path)
@@ -705,6 +707,11 @@ class MyrientDownloader(App):
             if remote == ":http:":
                 cmd.extend(["--http-url", BASE_URL])
 
+            # Debug: show the command in status for a moment
+            cmd_str = " ".join(cmd)
+            self._update_status_label(f"Running: {cmd[0]} {cmd[1]} {cmd[2]}")
+            time.sleep(1.5)
+
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -729,7 +736,10 @@ class MyrientDownloader(App):
             if process.returncode == 0:
                 self.notify("Turbo Download Complete!")
             else:
-                error_msg = last_lines[-1] if last_lines else f"Rclone failed with code {process.returncode}"
+                # Provide better context for common errors
+                error_msg = last_lines[-1] if last_lines else f"Exit Code {process.returncode}"
+                if "directory not found" in error_msg.lower():
+                    error_msg = "Source path not found on server. Try refreshing directory."
                 self.show_error(f"Rclone Failed: {error_msg}")
 
         except Exception as e:
@@ -972,6 +982,21 @@ class MyrientDownloader(App):
             def _update_progress(current_file=None):
                 done = self.files_completed + self.files_failed + self.files_skipped
                 total = self.total_files_to_download
+                
+                # Update progress bar
+                def _update_bar():
+                    try:
+                        bar = self.query_one("#progress", ProgressBar)
+                        if total > 0:
+                            bar.total = total
+                            bar.progress = done
+                        else:
+                            bar.total = None
+                    except Exception:
+                        pass
+                self.app.call_from_thread(_update_bar)
+
+                # Update status label
                 scanning = " scanning..." if not scan_done_event.is_set() else ""
                 workers_info = f" [{active_count} active]" if max_workers > 1 else ""
                 if current_file:
